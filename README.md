@@ -511,7 +511,7 @@ To use the following example you should make a compose file in the same director
 version: '3.8'
 services:
   neolink:
-    image: quantumentangledandy/neolink # If a specific version should be targetted, target it here with `:vx.x.x`
+    image: ivlovric/neolink # If a specific version should be targetted, target it here with `:vx.x.x`
     command: ["/usr/local/bin/neolink", "rtsp", "--config=/etc/neolink.toml"]  # The NEO_LINK_MODE can be set by modifying this command
     container_name: neolink
     ports:
