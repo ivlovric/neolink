@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  neolink:
+    image: ivlovric/neolink # If a specific version should be targetted, target it here with `:vx.x.x`
+    command: ["/usr/local/bin/neolink", "rtsp", "--config=/etc/neolink.toml"]  # The NEO_LINK_MODE can be set by modifying this command
+    container_name: neolink
+    ports:
+      - 8554:8554
+    volumes:
+      - $PWD/neolink.toml:/etc/neolink.toml
+    restart: unless-stopped

@@ -336,14 +336,23 @@ pub(super) async fn make_factory(
 
         match send_result {
             Some(Ok(())) => {
-                // Successfully sent, now wait for reply with timeout
-                match new_element.blocking_recv_timeout(Duration::from_secs(10)) {
-                    Ok(element) => Ok(Some(element)),
-                    Err(tokio::sync::oneshot::error::RecvTimeoutError::Timeout) => {
+                // Successfully sent, now wait for reply with timeout (10 seconds)
+                // Use a thread-based timeout since tokio::sync::oneshot doesn't have blocking_recv_timeout
+                let (timeout_tx, timeout_rx) = std::sync::mpsc::channel();
+
+                std::thread::spawn(move || {
+                    let result = new_element.blocking_recv();
+                    let _ = timeout_tx.send(result);
+                });
+
+                match timeout_rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(Ok(element)) => Ok(Some(element)),
+                    Ok(Err(_)) => Err(anyhow!("Pipeline creation channel closed")),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         Err(anyhow!("Timeout waiting for pipeline creation (10s)"))
                     }
-                    Err(tokio::sync::oneshot::error::RecvTimeoutError::Closed) => {
-                        Err(anyhow!("Pipeline creation channel closed"))
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(anyhow!("Pipeline creation timeout thread disconnected"))
                     }
                 }
             }
