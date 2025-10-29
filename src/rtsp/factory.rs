@@ -259,7 +259,9 @@ pub(super) async fn make_factory(
                                     &mut aud_ts,
                                     &stream_config,
                                 ) {
-                                    log::error!("{name}::{stream}: Error sending buffered frame: {e:?}");
+                                    log::error!(
+                                        "{name}::{stream}: Error sending buffered frame: {e:?}"
+                                    );
                                     return Err(e);
                                 }
                             }
@@ -277,7 +279,9 @@ pub(super) async fn make_factory(
                                 ) {
                                     Ok(_) => {}
                                     Err(e) => {
-                                        log::info!("{name}::{stream}: Failed to send to source: {e:?}");
+                                        log::info!(
+                                            "{name}::{stream}: Failed to send to source: {e:?}"
+                                        );
                                         return Err(e);
                                     }
                                 }
@@ -510,25 +514,13 @@ fn send_to_appsrc(
     let max_bytes = appsrc.max_bytes();
     let current_state = appsrc.current_state();
 
-    if current_level >= max_bytes * 2 / 3
-        && matches!(current_state, gstreamer::State::Paused)
-    {
+    if current_level >= max_bytes * 2 / 3 && matches!(current_state, gstreamer::State::Paused) {
         if let Err(e) = appsrc.set_state(gstreamer::State::Playing) {
-            log::warn!(
-                "Failed to set {} to Playing state: {:?}",
-                appsrc.name(),
-                e
-            );
+            log::warn!("Failed to set {} to Playing state: {:?}", appsrc.name(), e);
         }
-    } else if current_level <= max_bytes / 3
-        && matches!(current_state, gstreamer::State::Playing)
-    {
+    } else if current_level <= max_bytes / 3 && matches!(current_state, gstreamer::State::Playing) {
         if let Err(e) = appsrc.set_state(gstreamer::State::Paused) {
-            log::warn!(
-                "Failed to set {} to Paused state: {:?}",
-                appsrc.name(),
-                e
-            );
+            log::warn!("Failed to set {} to Paused state: {:?}", appsrc.name(), e);
         }
     }
     Ok(())

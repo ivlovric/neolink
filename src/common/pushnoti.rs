@@ -143,7 +143,7 @@ impl PushNotiThread {
                             );
                             // Don't retry certificate errors - they won't resolve automatically
                             // Wait longer before next attempt
-                            sleep(Duration::from_secs(300)).await;  // 5 minutes
+                            sleep(Duration::from_secs(300)).await; // 5 minutes
                         } else {
                             log::warn!(
                                 "Issue connecting to push notifications server: {:#}. \
