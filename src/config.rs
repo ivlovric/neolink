@@ -218,6 +218,9 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
+
+    #[serde(default = "default_transcode")]
+    pub(crate) transcode_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -512,6 +515,10 @@ fn default_2000() -> u64 {
 
 fn default_splash() -> SplashPattern {
     SplashPattern::Snow
+}
+
+fn default_transcode() -> Option<String> {
+    None
 }
 
 pub(crate) static RESERVED_NAMES: &[&str] = &["anyone", "anonymous"];

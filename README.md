@@ -29,6 +29,7 @@ features not yet in upstream master.
 - Motion Detection
 - Paused Streams (when no rtsp client or no motion detected)
 - Save a still image to disk
+- H.265 to H.264 video transcoding (for HomeKit/NVR compatibility)
 
 **Minor Features**:
 
@@ -63,7 +64,11 @@ sudo apt install \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
+  gstreamer1.0-libav \
   libssl
+
+# Optional: For H.265 to H.264 transcoding support
+sudo apt install gstreamer1.0-plugins-ugly gstreamer1.0-vaapi
 ```
 
 - **Windows**: You may also need to
@@ -404,6 +409,54 @@ ssue a user had)
 - **print_format:** Used for adjusting printing of some values mostly, battery
 messages
 
+### Video Transcoding
+
+If your camera streams H.265 video but you need H.264 (for example, for HomeKit
+compatibility), neolink can transcode the video on-the-fly.
+
+```toml
+[[cameras]]
+name = "Camera01"
+username = "admin"
+password = "password"
+uid = "ABCDEF0123456789"
+transcode_to = "h264"  # Transcode H.265 to H.264
+```
+
+**Important Notes:**
+
+- **CPU Usage:** Transcoding is CPU-intensive. Software encoding (x264enc) uses
+  approximately 15-30% CPU per stream on modern hardware. Hardware acceleration
+  (VAAPI) significantly reduces this if available.
+
+- **Latency:** Transcoding adds 100-300ms of latency due to decoding and
+  re-encoding overhead.
+
+- **Quality:** Transcoding maintains the original bitrate by default, resulting
+  in minimal quality loss.
+
+- **GStreamer Requirements:** Transcoding requires additional GStreamer plugins:
+  - **Decoder:** `gst-plugins-bad` (libde265dec) or `gst-libav` (avdec_h265)
+  - **Encoder:** `gst-plugins-ugly` (x264enc) for software encoding
+  - **Hardware:** `gstreamer-vaapi` (vaapih264enc) for Intel/AMD GPU acceleration
+
+The transcoding pipeline automatically selects the best available encoder:
+1. First tries hardware-accelerated VAAPI encoder (if available)
+2. Falls back to x264 software encoder with optimized settings
+
+**Installation of additional plugins:**
+
+```bash
+# Debian/Ubuntu
+sudo apt install gstreamer1.0-plugins-ugly gstreamer1.0-vaapi
+
+# Windows (with full GStreamer installation, x264enc is included)
+# No additional installation needed
+
+# macOS
+brew install gstreamer gst-plugins-ugly gst-libav
+```
+
 ### Pause
 
 To use the pause feature you will need to adjust your config file as such:
@@ -479,7 +532,8 @@ sent by the camera on motion or PIR alarms. To disable this you can set
 
 [Docker](https://hub.docker.com/r/quantumentangledandy/neolink) builds are also
 provided in multiple architectures. The latest tag tracks master while each
-branch gets it's own tag.
+branch gets it's own tag. Docker images include all GStreamer plugins needed
+for transcoding support.
 
 ```bash
 docker pull quantumentangledandy/neolink

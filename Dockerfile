@@ -57,6 +57,9 @@ LABEL repository="$REPO"
 LABEL version="$VERSION"
 LABEL maintainer="$OWNER"
 
+# Install runtime dependencies
+# gstreamer1.0-plugins-ugly: Provides x264enc for H.265->H.264 transcoding
+# gstreamer1.0-libav: Provides avdec_h265 decoder for transcoding
 # hadolint ignore=DL3008
 RUN apt-get update && \
     apt-get upgrade -y && \
@@ -72,6 +75,7 @@ RUN apt-get update && \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
+        gstreamer1.0-plugins-ugly \
         gstreamer1.0-libav && \
     apt-get clean -y && rm -rf /var/lib/apt/lists/*
 

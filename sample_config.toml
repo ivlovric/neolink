@@ -58,6 +58,11 @@ address = "192.168.1.187:9000"
 # If your device has user connection limits try a single stream instead.
 # stream = "mainStream"
 
+# If your camera streams H.265 but you need H.264 (e.g., for HomeKit compatibility),
+# uncomment the following to enable transcoding:
+# transcode_to = "h264"
+# Note: Transcoding requires additional CPU resources and will add latency
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers

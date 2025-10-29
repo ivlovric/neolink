@@ -30,6 +30,7 @@ struct StreamConfig {
     fps_table: Vec<u32>,
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
+    transcode_to: Option<String>,
 }
 impl StreamConfig {
     async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
@@ -92,6 +93,7 @@ impl StreamConfig {
             bitrate_table,
             vid_type: None,
             aud_type: None,
+            transcode_to: None,
         })
     }
 
@@ -180,6 +182,7 @@ pub(super) async fn make_factory(
                         let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
+                        stream_config.transcode_to = config.transcode_to.clone();
                         while let Some(media) = media_rx.recv().await {
                             stream_config.update_from_media(&media);
                             buffer.push(media);
@@ -200,8 +203,18 @@ pub(super) async fn make_factory(
                                 AnyResult::Ok(Some(src))
                             }
                             Some(VideoType::H265) => {
-                                let src = build_h265(&element, &stream_config)?;
-                                AnyResult::Ok(Some(src))
+                                // Check if transcoding to H264 is requested
+                                if stream_config.transcode_to.as_ref()
+                                    .map(|s| s.to_lowercase() == "h264")
+                                    .unwrap_or(false)
+                                {
+                                    log::info!("{name}::{stream}: Transcoding H.265 to H.264");
+                                    let src = build_h265_to_h264_transcode(&element, &stream_config)?;
+                                    AnyResult::Ok(Some(src))
+                                } else {
+                                    let src = build_h265(&element, &stream_config)?;
+                                    AnyResult::Ok(Some(src))
+                                }
                             }
                             None => {
                                 build_unknown(&element, &config.splash_pattern.to_string())?;
@@ -706,6 +719,96 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
     Ok(linked.appsrc)
 }
 
+fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
+    let buffer_size = buffer_size(stream_config.bitrate);
+    let bin_clone = bin
+        .clone()
+        .dynamic_cast::<Bin>()
+        .map_err(|_| anyhow!("Media source's element should be a bin"))?;
+
+    log::debug!("Building H.265 to H.264 transcoding pipeline");
+
+    // Create the appsrc for H.265 input
+    let source = make_element("appsrc", "vidsrc")?
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot cast to appsrc"))?;
+
+    source.set_is_live(false);
+    source.set_block(false);
+    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_property("emit-signals", false);
+    source.set_max_bytes(buffer_size as u64);
+    source.set_do_timestamp(false);
+    source.set_stream_type(AppStreamType::Stream);
+
+    let source_element = source
+        .clone()
+        .dynamic_cast::<Element>()
+        .map_err(|_| anyhow!("Cannot cast to element"))?;
+
+    // Build the transcoding pipeline: h265parse -> decoder -> encoder -> h264parse -> rtph264pay
+    let queue_in = make_queue("transcode_queue_in", buffer_size)?;
+    let h265_parser = make_element("h265parse", "h265parser")?;
+
+    // Try avdec_h265 first, fall back to other decoders if needed
+    let decoder = match make_element("avdec_h265", "h265decoder") {
+        Ok(dec) => Ok(dec),
+        Err(_) => make_element("libde265dec", "h265decoder"),
+    }?;
+
+    // H.264 encoder - try hardware encoders first, fall back to software
+    let encoder = match make_element("vaapih264enc", "h264encoder") {
+        Ok(enc) => {
+            log::debug!("Using hardware encoder: vaapih264enc");
+            enc
+        }
+        Err(_) => match make_element("x264enc", "h264encoder") {
+            Ok(enc) => {
+                log::debug!("Using software encoder: x264enc");
+                // Configure x264enc for low latency and quality balance
+                enc.set_property_from_str("tune", "zerolatency");
+                enc.set_property_from_str("speed-preset", "medium");
+                enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32); // Convert to kbps
+                enc.set_property("key-int-max", stream_config.fps * 2); // GOP size: 2 seconds
+                enc
+            }
+            Err(e) => {
+                return Err(anyhow!("No H.264 encoder available: {}", e));
+            }
+        },
+    };
+
+    let queue_out = make_queue("transcode_queue_out", buffer_size)?;
+    let h264_parser = make_element("h264parse", "h264parser")?;
+    let payload = make_element("rtph264pay", "pay0")?;
+
+    // Add all elements to the bin
+    bin_clone.add_many([
+        &source_element,
+        &queue_in,
+        &h265_parser,
+        &decoder,
+        &encoder,
+        &queue_out,
+        &h264_parser,
+        &payload,
+    ])?;
+
+    // Link the pipeline
+    Element::link_many([
+        &source_element,
+        &queue_in,
+        &h265_parser,
+        &decoder,
+        &encoder,
+        &queue_out,
+        &h264_parser,
+        &payload,
+    ])?;
+
+    Ok(source)
+}
+
 fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     // Audio seems to run at about 800kbs
     let buffer_size = 512 * 1416;
@@ -978,6 +1081,9 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "x265enc" => "x265 (gst-plugins-bad)",
             "avdec_h264" => "libav (gst-libav)",
             "avdec_h265" => "libav (gst-libav)",
+            "libde265dec" => "libde265 (gst-plugins-bad)",
+            "vaapih264enc" => "vaapi (gstreamer-vaapi)",
+            "vaapih265enc" => "vaapi (gstreamer-vaapi)",
             "videotestsrc" => "videotestsrc (gst-plugins-base)",
             "imagefreeze" => "imagefreeze (gst-plugins-good)",
             "audiotestsrc" => "audiotestsrc (gst-plugins-base)",
