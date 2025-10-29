@@ -241,6 +241,10 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
+                        // Clone name and stream for use after the blocking task
+                        let name_clone = name.clone();
+                        let stream_clone = stream;
+
                         // Spawn a blocking task to handle the frame streaming
                         // This needs to be blocking because we interact with GStreamer's C API
                         let stream_handle = tokio::task::spawn_blocking(move || {
@@ -293,15 +297,15 @@ pub(super) async fn make_factory(
                         // Wait for the streaming task to complete and propagate errors
                         match stream_handle.await {
                             Ok(Ok(())) => {
-                                log::debug!("{name}::{stream}: Streaming completed successfully");
+                                log::debug!("{name_clone}::{stream_clone}: Streaming completed successfully");
                                 AnyResult::Ok(())
                             }
                             Ok(Err(e)) => {
-                                log::error!("{name}::{stream}: Streaming error: {e:?}");
+                                log::error!("{name_clone}::{stream_clone}: Streaming error: {e:?}");
                                 Err(e)
                             }
                             Err(e) => {
-                                log::error!("{name}::{stream}: Streaming task panicked: {e:?}");
+                                log::error!("{name_clone}::{stream_clone}: Streaming task panicked: {e:?}");
                                 Err(anyhow!("Streaming task panicked: {e:?}"))
                             }
                         }
