@@ -154,7 +154,8 @@ pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
-    let (client_tx, mut client_rx) = mpsc(100);
+    // Increased from 100 to 200 to handle more concurrent client connections
+    let (client_tx, mut client_rx) = mpsc(200);
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
@@ -240,16 +241,16 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
-                        // Run blocking code on a seperate thread
-                        // This is not an async thread
-                        std::thread::spawn(move || {
+                        // Spawn a blocking task to handle the frame streaming
+                        // This needs to be blocking because we interact with GStreamer's C API
+                        let stream_handle = tokio::task::spawn_blocking(move || {
                             let mut aud_ts = 0u32;
                             let mut vid_ts = 0u32;
                             let mut pools = Default::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
-                                send_to_sources(
+                                if let Err(e) = send_to_sources(
                                     buffered,
                                     &mut pools,
                                     &vid_src,
@@ -257,12 +258,15 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
-                                )?;
+                                ) {
+                                    log::error!("{name}::{stream}: Error sending buffered frame: {e:?}");
+                                    return Err(e);
+                                }
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
+                                match send_to_sources(
                                     data,
                                     &mut pools,
                                     &vid_src,
@@ -270,16 +274,33 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                ) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        log::info!("{name}::{stream}: Failed to send to source: {e:?}");
+                                        return Err(e);
+                                    }
                                 }
-                                r?;
                             }
-                            log::trace!("All media recieved");
+                            log::trace!("{name}::{stream}: All media received, streaming ended");
                             AnyResult::Ok(())
                         });
-                        AnyResult::Ok(())
+
+                        // Wait for the streaming task to complete and propagate errors
+                        match stream_handle.await {
+                            Ok(Ok(())) => {
+                                log::debug!("{name}::{stream}: Streaming completed successfully");
+                                AnyResult::Ok(())
+                            }
+                            Ok(Err(e)) => {
+                                log::error!("{name}::{stream}: Streaming error: {e:?}");
+                                Err(e)
+                            }
+                            Err(e) => {
+                                log::error!("{name}::{stream}: Streaming task panicked: {e:?}");
+                                Err(anyhow!("Streaming task panicked: {e:?}"))
+                            }
+                        }
                     });
                 }
             }
@@ -290,13 +311,58 @@ pub(super) async fn make_factory(
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
         let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
 
-        let element = new_element.blocking_recv()?;
-        Ok(Some(element))
+        // Try to send with timeout to avoid blocking GStreamer thread pool indefinitely
+        // Use try_send in a loop with short sleeps (max 5 seconds total)
+        let mut msg = Some(ClientMsg::NewClient { element, reply });
+        let send_result = (0..50).find_map(|_| {
+            match client_tx.try_send(msg.take().unwrap()) {
+                Ok(_) => Some(Ok(())),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned_msg)) => {
+                    // Channel full, wait a bit and retry
+                    msg = Some(returned_msg);
+                    std::thread::sleep(Duration::from_millis(100));
+                    None
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    Some(Err(anyhow!("Client channel closed")))
+                }
+            }
+        });
+
+        match send_result {
+            Some(Ok(())) => {
+                // Successfully sent, now wait for reply with timeout
+                match new_element.blocking_recv_timeout(Duration::from_secs(10)) {
+                    Ok(element) => Ok(Some(element)),
+                    Err(tokio::sync::oneshot::error::RecvTimeoutError::Timeout) => {
+                        Err(anyhow!("Timeout waiting for pipeline creation (10s)"))
+                    }
+                    Err(tokio::sync::oneshot::error::RecvTimeoutError::Closed) => {
+                        Err(anyhow!("Pipeline creation channel closed"))
+                    }
+                }
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(anyhow!("Timeout trying to send client message (5s)")),
+        }
     })
     .await?;
     Ok((factory, thread))
+}
+
+/// Helper function to create and configure a buffer pool
+fn create_buffer_pool(size: usize) -> AnyResult<gstreamer::BufferPool> {
+    let pool = gstreamer::BufferPool::new();
+    let mut pool_config = pool.config();
+    // Set a max buffers to ensure we don't grow in memory endlessly
+    // min=8, max=32 buffers per pool
+    pool_config.set_params(None, size as u32, 8, 32);
+    pool.set_config(pool_config)
+        .map_err(|e| anyhow!("Failed to set buffer pool config: {:?}", e))?;
+    pool.set_active(true)
+        .map_err(|e| anyhow!("Failed to activate buffer pool: {:?}", e))?;
+    Ok(pool)
 }
 
 fn send_to_sources(
@@ -384,24 +450,30 @@ fn send_to_appsrc(
         let msg_size = data.len();
 
         // Get or create a pool of this len
-        let pool = pools.entry(msg_size).or_insert_with_key(|size| {
-            let pool = gstreamer::BufferPool::new();
-            let mut pool_config = pool.config();
-            // Set a max buffers to ensure we don't grow in memory endlessly
-            pool_config.set_params(None, (*size) as u32, 8, 32);
-            pool.set_config(pool_config).unwrap();
-            pool.set_active(true).unwrap();
-            pool
-        });
+        let pool = match pools.entry(msg_size) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let size = *e.key();
+                let pool = create_buffer_pool(size)
+                    .with_context(|| format!("Failed to create buffer pool for size {}", size))?;
+                e.insert(pool)
+            }
+        };
 
         // Get a buffer from the pool and then copy in the data
         let gst_buf = {
-            let mut new_buf = pool.acquire_buffer(None).unwrap();
-            let gst_buf_mut = new_buf.get_mut().unwrap();
+            let mut new_buf = pool
+                .acquire_buffer(None)
+                .map_err(|e| anyhow!("Failed to acquire buffer from pool: {:?}", e))?;
+            let gst_buf_mut = new_buf
+                .get_mut()
+                .ok_or_else(|| anyhow!("Failed to get mutable reference to buffer"))?;
             let time = ClockTime::from_useconds(ts.as_micros() as u64);
             gst_buf_mut.set_dts(time);
             gst_buf_mut.set_pts(time);
-            let mut gst_buf_data = gst_buf_mut.map_writable().unwrap();
+            let mut gst_buf_data = gst_buf_mut
+                .map_writable()
+                .map_err(|_| anyhow!("Failed to map buffer as writable"))?;
             gst_buf_data.copy_from_slice(data.as_slice());
             drop(gst_buf_data);
             new_buf
@@ -432,15 +504,32 @@ fn send_to_appsrc(
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
-    // Check if we need to pause
-    if appsrc.current_level_bytes() >= appsrc.max_bytes() * 2 / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Paused)
+    // Check if we need to pause/resume based on buffer levels
+    // Use hysteresis to avoid rapid state changes
+    let current_level = appsrc.current_level_bytes();
+    let max_bytes = appsrc.max_bytes();
+    let current_state = appsrc.current_state();
+
+    if current_level >= max_bytes * 2 / 3
+        && matches!(current_state, gstreamer::State::Paused)
     {
-        appsrc.set_state(gstreamer::State::Playing).unwrap();
-    } else if appsrc.current_level_bytes() <= appsrc.max_bytes() / 3
-        && matches!(appsrc.current_state(), gstreamer::State::Playing)
+        if let Err(e) = appsrc.set_state(gstreamer::State::Playing) {
+            log::warn!(
+                "Failed to set {} to Playing state: {:?}",
+                appsrc.name(),
+                e
+            );
+        }
+    } else if current_level <= max_bytes / 3
+        && matches!(current_state, gstreamer::State::Playing)
     {
-        appsrc.set_state(gstreamer::State::Paused).unwrap();
+        if let Err(e) = appsrc.set_state(gstreamer::State::Paused) {
+            log::warn!(
+                "Failed to set {} to Paused state: {:?}",
+                appsrc.name(),
+                e
+            );
+        }
     }
     Ok(())
 }
@@ -960,4 +1049,118 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_buffer_pool_success() {
+        gstreamer::init().ok();
+        let result = create_buffer_pool(1024);
+        assert!(result.is_ok(), "Buffer pool creation should succeed");
+        let pool = result.unwrap();
+        assert!(pool.is_active(), "Pool should be active");
+    }
+
+    #[test]
+    fn test_create_buffer_pool_various_sizes() {
+        gstreamer::init().ok();
+        // Test various sizes
+        for size in [512, 1024, 4096, 8192, 16384] {
+            let result = create_buffer_pool(size);
+            assert!(
+                result.is_ok(),
+                "Buffer pool creation should succeed for size {}",
+                size
+            );
+        }
+    }
+
+    #[test]
+    fn test_buffer_size_calculation() {
+        // Test minimum size
+        assert_eq!(buffer_size(0), 4 * 1024);
+        assert_eq!(buffer_size(1000), 4 * 1024);
+
+        // Test bitrate-based size
+        assert_eq!(buffer_size(1000000), 250000); // 1 Mbps
+        assert_eq!(buffer_size(5000000), 1250000); // 5 Mbps
+    }
+
+    #[test]
+    fn test_audio_type_variants() {
+        let aac = AudioType::Aac;
+        let adpcm = AudioType::Adpcm(512);
+
+        // Ensure variants can be created and matched
+        match aac {
+            AudioType::Aac => {}
+            _ => panic!("Expected Aac variant"),
+        }
+
+        match adpcm {
+            AudioType::Adpcm(512) => {}
+            _ => panic!("Expected Adpcm(512) variant"),
+        }
+    }
+
+    #[test]
+    fn test_stream_config_fps_update() {
+        let mut config = StreamConfig {
+            resolution: [1920, 1080],
+            bitrate: 2000000,
+            fps: 25,
+            fps_table: vec![15, 20, 25, 30],
+            bitrate_table: vec![1000000, 2000000, 3000000],
+            vid_type: None,
+            aud_type: None,
+        };
+
+        // Test FPS update from table
+        config.update_fps(2);
+        assert_eq!(config.fps, 25);
+
+        // Test FPS update with out-of-bounds index
+        config.update_fps(10);
+        assert_eq!(config.fps, 10); // Should use the index value directly
+    }
+
+    #[test]
+    fn test_stream_config_bitrate_update() {
+        let mut config = StreamConfig {
+            resolution: [1920, 1080],
+            bitrate: 2000000,
+            fps: 25,
+            fps_table: vec![15, 20, 25, 30],
+            bitrate_table: vec![1000000, 2000000, 3000000],
+            vid_type: None,
+            aud_type: None,
+        };
+
+        // Test bitrate update from table
+        config.update_bitrate(1);
+        assert_eq!(config.bitrate, 2000000);
+
+        // Test bitrate update with out-of-bounds index
+        config.update_bitrate(10);
+        assert_eq!(config.bitrate, 10); // Should use the index value directly
+    }
+
+    #[cfg(feature = "gstreamer")]
+    #[tokio::test]
+    async fn test_make_dummy_factory() {
+        gstreamer::init().ok();
+        let result = make_dummy_factory(false, "smpte".to_string()).await;
+        assert!(result.is_ok(), "Dummy factory creation should succeed");
+    }
+
+    #[cfg(feature = "gstreamer")]
+    #[tokio::test]
+    async fn test_make_dummy_factory_with_splash() {
+        gstreamer::init().ok();
+        let result = make_dummy_factory(true, "snow".to_string()).await;
+        assert!(result.is_ok(), "Dummy factory with splash should succeed");
+    }
 }

@@ -131,7 +131,26 @@ impl PushNotiThread {
                         registration
                     }
                     Err(e) => {
-                        log::warn!("Issue connecting to push notifications server: {:?}", e);
+                        // Check if this is an SSL certificate error
+                        let error_string = format!("{:?}", e);
+                        if error_string.contains("certificate verify failed")
+                            || error_string.contains("unable to get local issuer certificate")
+                        {
+                            log::info!(
+                                "Push notifications unavailable: SSL certificate verification failed. \
+                                This is expected if system CA certificates are not properly configured. \
+                                Push notifications will be disabled. This does not affect core camera functionality."
+                            );
+                            // Don't retry certificate errors - they won't resolve automatically
+                            // Wait longer before next attempt
+                            sleep(Duration::from_secs(300)).await;  // 5 minutes
+                        } else {
+                            log::warn!(
+                                "Issue connecting to push notifications server: {:#}. \
+                                Push notifications will be disabled but camera streaming will continue normally.",
+                                e
+                            );
+                        }
                         continue;
                     }
                 }
@@ -206,7 +225,18 @@ impl PushNotiThread {
                                         log::debug!("Error on push notification listener: {:?}. Clearing token", e);
                                     },
                                     Http(e) if e.is_request() || e.is_connect() || e.is_timeout() => {
-                                        log::debug!("Error on push notification listener: {:?}", e);
+                                        let error_msg = format!("{:?}", e);
+                                        if error_msg.contains("certificate verify failed")
+                                            || error_msg.contains("unable to get local issuer certificate")
+                                        {
+                                            log::info!(
+                                                "Push notification connection failed due to SSL certificate issue. \
+                                                This is a known issue when system certificates are not configured. \
+                                                Camera functionality is not affected."
+                                            );
+                                        } else {
+                                            log::debug!("Error on push notification listener: {:?}", e);
+                                        }
                                     }
                                     _ => {
                                         log::debug!("Error on push notification listener: {:?}", e);

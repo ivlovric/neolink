@@ -18,7 +18,9 @@ impl NeoInstance {
         let name = config.name.clone();
 
         let media_rx = if config.pause.on_motion {
-            let (media_tx, media_rx) = tokio::sync::mpsc::channel(100);
+            // Increased from 100 to 500 frames to handle backpressure better
+            // At 25-30 fps, this provides ~16-20 seconds of buffer
+            let (media_tx, media_rx) = tokio::sync::mpsc::channel(500);
             let counter = UseCounter::new().await;
 
             let mut md = self.motion().await?;
@@ -176,7 +178,9 @@ impl NeoInstance {
 
     /// Streams a camera source
     pub(crate) async fn stream(&self, stream: StreamKind) -> AnyResult<MpscReceiver<BcMedia>> {
-        let (media_tx, media_rx) = tokio::sync::mpsc::channel(100);
+        // Increased from 100 to 500 frames to handle backpressure better
+        // At 25-30 fps, this provides ~16-20 seconds of buffer
+        let (media_tx, media_rx) = tokio::sync::mpsc::channel(500);
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();
