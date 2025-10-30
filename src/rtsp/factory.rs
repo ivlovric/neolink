@@ -632,7 +632,7 @@ fn test_pipeline_initialization(bin: &Bin, timeout_ms: u64) -> Result<()> {
                     ));
                 }
                 MessageView::Warning(warn) => {
-                    let warning_msg = warn.warning().to_string();
+                    let warning_msg = warn.error().to_string();
                     let debug_info = warn.debug().unwrap_or_else(|| "No debug info".into());
                     let src_name = msg.src().map(|s| s.name()).unwrap_or_else(|| "Unknown".into());
 
@@ -645,7 +645,8 @@ fn test_pipeline_initialization(bin: &Bin, timeout_ms: u64) -> Result<()> {
                     }
                 }
                 MessageView::Info(info) => {
-                    log::trace!("GStreamer info: {}", info.message().to_string());
+                    let debug_info = info.debug().unwrap_or_else(|| "No debug info".into());
+                    log::trace!("GStreamer info: {}", debug_info);
                 }
                 MessageView::StateChanged(sc) => {
                     if let Some(src) = msg.src() {
@@ -671,7 +672,9 @@ fn test_vaapi_encoder() -> bool {
 
     // Try to create a simple test pipeline with VAAPI
     let test_result = (|| -> Result<()> {
-        let pipeline = gstreamer::Pipeline::new(Some("vaapi_test"));
+        let pipeline = gstreamer::Pipeline::builder()
+            .name("vaapi_test")
+            .build();
 
         // Create test elements
         let videotestsrc = make_element("videotestsrc", "test_src")?;
