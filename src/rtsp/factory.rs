@@ -741,46 +741,76 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
     source.set_do_timestamp(false);
     source.set_stream_type(AppStreamType::Stream);
 
+    // Set caps for H.265 bytestream input
+    source.set_caps(Some(
+        &Caps::builder("video/x-h265")
+            .field("stream-format", "byte-stream")
+            .build(),
+    ));
+
     let source_element = source
         .clone()
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast to element"))?;
 
-    // Build the transcoding pipeline: h265parse -> decoder -> encoder -> h264parse -> rtph264pay
+    // Build the transcoding pipeline: h265parse -> decoder -> videoconvert -> encoder -> h264parse -> rtph264pay
     let queue_in = make_queue("transcode_queue_in", buffer_size)?;
     let h265_parser = make_element("h265parse", "h265parser")?;
 
     // Try avdec_h265 first, fall back to other decoders if needed
     let decoder = match make_element("avdec_h265", "h265decoder") {
-        Ok(dec) => Ok(dec),
-        Err(_) => make_element("libde265dec", "h265decoder"),
+        Ok(dec) => {
+            log::debug!("Using libav H.265 decoder: avdec_h265");
+            Ok(dec)
+        }
+        Err(_) => {
+            log::debug!("avdec_h265 not available, trying libde265dec");
+            make_element("libde265dec", "h265decoder")
+        }
     }?;
+
+    // Add videoconvert to handle format conversion between decoder and encoder
+    let videoconvert = make_element("videoconvert", "format_converter")?;
+
+    // Add a capsfilter to ensure we get a format the encoder can handle
+    let capsfilter = make_element("capsfilter", "format_filter")?;
+    capsfilter.set_property(
+        "caps",
+        &Caps::builder("video/x-raw")
+            .field("format", "I420")  // Standard format that both encoders support
+            .build(),
+    );
 
     // H.264 encoder - try hardware encoders first, fall back to software
     let encoder = match make_element("vaapih264enc", "h264encoder") {
         Ok(enc) => {
-            log::debug!("Using hardware encoder: vaapih264enc");
+            log::info!("Using VAAPI hardware encoder for transcoding");
+            // Configure vaapih264enc
+            enc.set_property("rate-control", 2u32); // CBR mode
+            enc.set_property("bitrate", (stream_config.bitrate / 1000) as u32); // Convert to kbps
+            enc.set_property("keyframe-period", stream_config.fps * 2); // GOP size: 2 seconds
             enc
         }
-        Err(_) => match make_element("x264enc", "h264encoder") {
-            Ok(enc) => {
-                log::debug!("Using software encoder: x264enc");
-                // Configure x264enc for low latency and quality balance
-                enc.set_property_from_str("tune", "zerolatency");
-                enc.set_property_from_str("speed-preset", "medium");
-                enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32); // Convert to kbps
-                enc.set_property("key-int-max", stream_config.fps * 2); // GOP size: 2 seconds
-                enc
-            }
-            Err(e) => {
-                return Err(anyhow!("No H.264 encoder available: {}", e));
-            }
-        },
+        Err(_) => {
+            log::info!("VAAPI not available, using x264enc software encoder for transcoding");
+            let enc = make_element("x264enc", "h264encoder")
+                .map_err(|e| anyhow!("No H.264 encoder available (tried vaapih264enc and x264enc): {}", e))?;
+
+            // Configure x264enc for low latency and quality balance
+            enc.set_property_from_str("tune", "zerolatency");
+            enc.set_property_from_str("speed-preset", "medium");
+            enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32); // Convert to kbps
+            enc.set_property("key-int-max", stream_config.fps * 2); // GOP size: 2 seconds
+            enc
+        }
     };
 
     let queue_out = make_queue("transcode_queue_out", buffer_size)?;
     let h264_parser = make_element("h264parse", "h264parser")?;
     let payload = make_element("rtph264pay", "pay0")?;
+
+    // Configure rtph264pay for better compatibility
+    payload.set_property("config-interval", -1i32); // Send SPS/PPS with every keyframe
 
     // Add all elements to the bin
     bin_clone.add_many([
@@ -788,6 +818,8 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
         &queue_in,
         &h265_parser,
         &decoder,
+        &videoconvert,
+        &capsfilter,
         &encoder,
         &queue_out,
         &h264_parser,
@@ -800,12 +832,15 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
         &queue_in,
         &h265_parser,
         &decoder,
+        &videoconvert,
+        &capsfilter,
         &encoder,
         &queue_out,
         &h264_parser,
         &payload,
     ])?;
 
+    log::debug!("Transcoding pipeline built successfully");
     Ok(source)
 }
 
@@ -1069,6 +1104,8 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
         let plugin = match kind {
             "appsrc" => "app (gst-plugins-base)",
             "audioconvert" => "audioconvert (gst-plugins-base)",
+            "videoconvert" => "videoconvert (gst-plugins-base)",
+            "capsfilter" => "coreelements (gst-plugins-base)",
             "adpcmdec" => "Required for audio",
             "h264parse" => "videoparsersbad (gst-plugins-bad)",
             "h265parse" => "videoparsersbad (gst-plugins-bad)",
@@ -1227,6 +1264,7 @@ mod tests {
             bitrate_table: vec![1000000, 2000000, 3000000],
             vid_type: None,
             aud_type: None,
+            transcode_to: None,
         };
 
         // Test FPS update from table
@@ -1248,6 +1286,7 @@ mod tests {
             bitrate_table: vec![1000000, 2000000, 3000000],
             vid_type: None,
             aud_type: None,
+            transcode_to: None,
         };
 
         // Test bitrate update from table
