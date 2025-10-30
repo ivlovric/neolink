@@ -60,6 +60,10 @@ LABEL maintainer="$OWNER"
 # Install runtime dependencies
 # gstreamer1.0-plugins-ugly: Provides x264enc for H.265->H.264 transcoding
 # gstreamer1.0-libav: Provides avdec_h265 decoder for transcoding
+# gstreamer1.0-vaapi: Hardware acceleration via VA-API (Intel/AMD)
+# i965-va-driver: Intel GPU driver (Broadwell through Coffee Lake, Gen 8-9)
+# intel-media-va-driver: Intel GPU driver (Broadwell+ optimized, Gen 8+)
+# mesa-va-drivers: AMD GPU driver and modern Intel fallback
 # hadolint ignore=DL3008
 RUN apt-get update && \
     apt-get upgrade -y && \
@@ -76,7 +80,11 @@ RUN apt-get update && \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly \
-        gstreamer1.0-libav && \
+        gstreamer1.0-libav \
+        gstreamer1.0-vaapi \
+        i965-va-driver \
+        intel-media-va-driver \
+        mesa-va-drivers && \
     apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build \
