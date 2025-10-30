@@ -1077,40 +1077,39 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
     let h265_parser = make_element("h265parse", "h265parser")?;
 
     // Try hardware decoders first for better performance, then fall back to software
-    let decoder = {
+    // Track whether we're using a VA-API decoder (outputs VA memory)
+    let (decoder, is_vaapi_decoder) = {
         // Try VA-API 2.0 hardware decoder first
         if let Ok(dec) = make_element("vah265dec", "h265decoder") {
             log::info!("Using VA-API 2.0 hardware H.265 decoder: vah265dec");
-            dec
+            (dec, true)
         }
         // Try legacy VAAPI hardware decoder
         else if let Ok(dec) = make_element("vaapih265dec", "h265decoder") {
             log::info!("Using legacy VAAPI hardware H.265 decoder: vaapih265dec");
-            dec
+            (dec, true)
         }
         // Fall back to libav software decoder
         else if let Ok(dec) = make_element("avdec_h265", "h265decoder") {
-            log::debug!("Using libav software H.265 decoder: avdec_h265");
-            dec
+            log::info!("Using libav software H.265 decoder: avdec_h265");
+            (dec, false)
         }
         // Last resort: libde265 software decoder
         else {
-            log::debug!("Trying libde265 software H.265 decoder");
-            make_element("libde265dec", "h265decoder")?
+            log::info!("Trying libde265 software H.265 decoder");
+            (make_element("libde265dec", "h265decoder")?, false)
         }
     };
 
-    // Add videoconvert to handle format conversion between decoder and encoder
-    let videoconvert = make_element("videoconvert", "format_converter")?;
-
-    // Add a capsfilter to ensure we get a format the encoder can handle
-    let capsfilter = make_element("capsfilter", "format_filter")?;
-    capsfilter.set_property(
-        "caps",
-        &Caps::builder("video/x-raw")
-            .field("format", "I420")  // Standard format that both encoders support
-            .build(),
-    );
+    // Build the format conversion pipeline based on decoder and encoder types
+    // VA decoders output VA memory, software decoders output system memory
+    // VA encoders need VA memory, software encoders need system memory
+    //
+    // Pipeline options:
+    // 1. VAAPI decoder → VAAPI encoder: Use vapostproc (stays in VA memory)
+    // 2. VAAPI decoder → Software encoder: Use vapostproc to download to system memory
+    // 3. Software decoder → Software encoder: Use videoconvert (system memory)
+    // 4. Software decoder → VAAPI encoder: Use videoconvert + upload (rare, but possible)
 
     // H.264 encoder - use the specified encoder type
     let encoder = match encoder_type {
@@ -1200,6 +1199,35 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
         }
     };
 
+    // Create format conversion elements based on decoder and encoder types
+    let conversion_elements: Vec<Element> = match (is_vaapi_decoder, encoder_type) {
+        (true, H264EncoderType::VAAPI) => {
+            // VAAPI → VAAPI: Use vapostproc to stay in VA memory
+            log::debug!("Using vapostproc for VAAPI-to-VAAPI transcoding (VA memory only)");
+            let vapostproc = make_element("vapostproc", "format_converter")?;
+            vec![vapostproc]
+        }
+        (true, H264EncoderType::Software) => {
+            // VAAPI → Software: Use vapostproc to download from VA memory to system memory
+            log::debug!("Using vapostproc + videoconvert for VAAPI-to-software transcoding");
+            let vapostproc = make_element("vapostproc", "va_downloader")?;
+            let videoconvert = make_element("videoconvert", "format_converter")?;
+            vec![vapostproc, videoconvert]
+        }
+        (false, H264EncoderType::VAAPI) => {
+            // Software → VAAPI: Use videoconvert (GStreamer will auto-upload to VA memory if needed)
+            log::debug!("Using videoconvert for software-to-VAAPI transcoding");
+            let videoconvert = make_element("videoconvert", "format_converter")?;
+            vec![videoconvert]
+        }
+        (false, H264EncoderType::Software) => {
+            // Software → Software: Use videoconvert for format conversion
+            log::debug!("Using videoconvert for software-to-software transcoding");
+            let videoconvert = make_element("videoconvert", "format_converter")?;
+            vec![videoconvert]
+        }
+    };
+
     let queue_out = make_queue("transcode_queue_out", buffer_size)?;
     let h264_parser = make_element("h264parse", "h264parser")?;
     let payload = make_element("rtph264pay", "pay0")?;
@@ -1207,34 +1235,53 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
     // Configure rtph264pay for better compatibility
     payload.set_property("config-interval", -1i32); // Send SPS/PPS with every keyframe
 
-    // Add all elements to the bin
-    bin_clone.add_many([
+    // Build element list for adding to bin
+    let mut elements = vec![
         &source_element,
         &queue_in,
         &h265_parser,
         &decoder,
-        &videoconvert,
-        &capsfilter,
+    ];
+
+    // Add conversion elements
+    let conversion_refs: Vec<&Element> = conversion_elements.iter().collect();
+    elements.extend(conversion_refs);
+
+    // Add encoder and output elements
+    elements.extend([
         &encoder,
         &queue_out,
         &h264_parser,
         &payload,
-    ])?;
+    ]);
+
+    // Add all elements to the bin
+    bin_clone.add_many(&elements)?;
+
+    // Build linking list (same order as element list)
+    let mut link_list = vec![
+        &source_element,
+        &queue_in,
+        &h265_parser,
+        &decoder,
+    ];
+
+    link_list.extend(conversion_refs);
+
+    link_list.extend([
+        &encoder,
+        &queue_out,
+        &h264_parser,
+        &payload,
+    ]);
 
     // Link the pipeline
-    Element::link_many([
-        &source_element,
-        &queue_in,
-        &h265_parser,
-        &decoder,
-        &videoconvert,
-        &capsfilter,
-        &encoder,
-        &queue_out,
-        &h264_parser,
-        &payload,
-    ]).map_err(|e| {
+    Element::link_many(&link_list).map_err(|e| {
         log::error!("Failed to link transcoding pipeline elements: {:?}", e);
+        log::error!("Pipeline structure: decoder ({}) → conversion → encoder ({})",
+            if is_vaapi_decoder { "VAAPI" } else { "software" },
+            match encoder_type { H264EncoderType::VAAPI => "VAAPI", H264EncoderType::Software => "software" }
+        );
         anyhow!("Pipeline linking failed: {:?}", e)
     })?;
 
@@ -1537,6 +1584,7 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "vah265enc" => "va (gstreamer-va, VA-API 2.0)",
             "vaapih264enc" => "vaapi (gstreamer-vaapi, legacy)",
             "vaapih265enc" => "vaapi (gstreamer-vaapi, legacy)",
+            "vapostproc" => "va (gstreamer-va, VA-API 2.0 postprocessor)",
             "videotestsrc" => "videotestsrc (gst-plugins-base)",
             "imagefreeze" => "imagefreeze (gst-plugins-good)",
             "audiotestsrc" => "audiotestsrc (gst-plugins-base)",
