@@ -1245,7 +1245,7 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
 
     // Add conversion elements
     let conversion_refs: Vec<&Element> = conversion_elements.iter().collect();
-    elements.extend(conversion_refs);
+    elements.extend(conversion_refs.clone());
 
     // Add encoder and output elements
     elements.extend([
