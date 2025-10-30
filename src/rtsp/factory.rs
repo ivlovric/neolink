@@ -254,6 +254,23 @@ pub(super) async fn make_factory(
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
+                        // Wait a brief moment to allow the RTSP server to initialize the pipeline
+                        // This is critical for transcoding pipelines where encoders need time to initialize
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+
+                        // Verify the pipeline is ready before sending frames
+                        if let Some(vid_src) = vid_src.as_ref() {
+                            // Check if the appsrc is still valid after pipeline initialization
+                            if let Err(e) = check_live(vid_src) {
+                                log::error!("{name}::{stream}: Pipeline validation failed: {e:?}");
+                                log::error!("{name}::{stream}: This usually indicates that GStreamer elements failed to initialize.");
+                                log::error!("{name}::{stream}: For transcoding issues, check VAAPI/hardware encoder availability.");
+                                return Err(anyhow!("Pipeline not ready: {e:?}"));
+                            }
+                        }
+
+                        log::trace!("{name}::{stream}: Pipeline validated, ready to send frames");
+
                         // Clone name and stream for use after the blocking task
                         let name_clone = name.clone();
                         let stream_clone = stream;
@@ -552,12 +569,28 @@ fn send_to_appsrc(
     Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
-    app.bus().ok_or(anyhow!("App source is closed"))?;
-    app.pads()
-        .iter()
-        .all(|pad| pad.is_linked())
-        .then_some(())
-        .ok_or(anyhow!("App source is not linked"))
+    // Check if bus exists - this indicates the element is part of a valid pipeline
+    if app.bus().is_none() {
+        log::error!("check_live: App source has no bus (element may have been destroyed or removed from bin)");
+        log::error!("check_live: App source state: {:?}", app.current_state());
+        log::error!("check_live: This often indicates a GStreamer element initialization failure");
+        return Err(anyhow!("App source is closed"));
+    }
+
+    // Check if pads are linked
+    let pads = app.pads();
+    if pads.is_empty() {
+        log::warn!("check_live: App source has no pads");
+    } else {
+        let linked_count = pads.iter().filter(|pad| pad.is_linked()).count();
+        if linked_count == 0 {
+            log::error!("check_live: App source has {} pads but none are linked", pads.len());
+            return Err(anyhow!("App source is not linked"));
+        }
+        log::trace!("check_live: App source has {}/{} pads linked", linked_count, pads.len());
+    }
+
+    Ok(())
 }
 
 fn clear_bin(bin: &Element) -> Result<()> {
@@ -782,27 +815,61 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
     );
 
     // H.264 encoder - try hardware encoders first, fall back to software
-    let encoder = match make_element("vaapih264enc", "h264encoder") {
-        Ok(enc) => {
+    // Attempt VAAPI first
+    let encoder = 'encoder_selection: {
+        if let Ok(enc) = make_element("vaapih264enc", "h264encoder") {
             log::info!("Using VAAPI hardware encoder for transcoding");
-            // Configure vaapih264enc
-            enc.set_property_from_str("rate-control", "cbr"); // CBR mode
-            enc.set_property("bitrate", (stream_config.bitrate / 1000) as u32); // Convert to kbps
-            enc.set_property("keyframe-period", stream_config.fps * 2); // GOP size: 2 seconds
-            enc
-        }
-        Err(_) => {
-            log::info!("VAAPI not available, using x264enc software encoder for transcoding");
-            let enc = make_element("x264enc", "h264encoder")
-                .map_err(|e| anyhow!("No H.264 encoder available (tried vaapih264enc and x264enc): {}", e))?;
 
-            // Configure x264enc for low latency and quality balance
-            enc.set_property_from_str("tune", "zerolatency");
-            enc.set_property_from_str("speed-preset", "medium");
-            enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32); // Convert to kbps
-            enc.set_property("key-int-max", stream_config.fps * 2); // GOP size: 2 seconds
-            enc
+            // Validate encoder parameters before setting them
+            let bitrate_kbps = stream_config.bitrate / 1000;
+            let keyframe_period = stream_config.fps * 2;
+
+            // Ensure bitrate is reasonable (at least 100 kbps, max 50 Mbps)
+            let safe_bitrate = bitrate_kbps.clamp(100, 50000);
+            if bitrate_kbps != safe_bitrate {
+                log::warn!("VAAPI encoder: Adjusting bitrate from {} kbps to {} kbps", bitrate_kbps, safe_bitrate);
+            }
+
+            // Ensure keyframe period is reasonable (at least 10 frames, max 300)
+            let safe_keyframe = keyframe_period.clamp(10, 300);
+            if keyframe_period != safe_keyframe {
+                log::warn!("VAAPI encoder: Adjusting keyframe-period from {} to {}", keyframe_period, safe_keyframe);
+            }
+
+            // Try to configure VAAPI encoder - if any step fails, fall back to software
+            if let Err(e) = enc.set_property_from_str("rate-control", "cbr") {
+                log::error!("VAAPI encoder: Failed to set rate-control: {:?}", e);
+                log::warn!("Falling back to x264enc software encoder");
+            } else if let Err(e) = enc.set_property("bitrate", safe_bitrate) {
+                log::error!("VAAPI encoder: Failed to set bitrate: {:?}", e);
+                log::warn!("Falling back to x264enc software encoder");
+            } else if let Err(e) = enc.set_property("keyframe-period", safe_keyframe) {
+                log::error!("VAAPI encoder: Failed to set keyframe-period: {:?}", e);
+                log::warn!("Falling back to x264enc software encoder");
+            } else {
+                // VAAPI configured successfully
+                log::debug!("VAAPI encoder configured: bitrate={} kbps, keyframe-period={}", safe_bitrate, safe_keyframe);
+                break 'encoder_selection enc;
+            }
         }
+
+        // Fall back to x264enc software encoder
+        log::info!("Using x264enc software encoder for transcoding");
+        let enc = make_element("x264enc", "h264encoder")
+            .map_err(|e| anyhow!("No H.264 encoder available (tried vaapih264enc and x264enc): {}", e))?;
+
+        // Configure x264enc for low latency and quality balance
+        enc.set_property_from_str("tune", "zerolatency")
+            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?;
+        enc.set_property_from_str("speed-preset", "medium")
+            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?;
+        enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32)
+            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?; // Convert to kbps
+        enc.set_property("key-int-max", stream_config.fps * 2)
+            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?; // GOP size: 2 seconds
+
+        log::debug!("x264enc configured successfully");
+        enc
     };
 
     let queue_out = make_queue("transcode_queue_out", buffer_size)?;
@@ -838,9 +905,25 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
         &queue_out,
         &h264_parser,
         &payload,
-    ])?;
+    ]).map_err(|e| {
+        log::error!("Failed to link transcoding pipeline elements: {:?}", e);
+        anyhow!("Pipeline linking failed: {:?}", e)
+    })?;
 
-    log::debug!("Transcoding pipeline built successfully");
+    // Verify that the source element is properly added to the bin
+    // and has a valid bus (indicating it's part of a functioning pipeline)
+    if source.bus().is_none() {
+        log::error!("Transcoding pipeline: appsrc has no bus after linking");
+        return Err(anyhow!("Pipeline construction failed: appsrc not properly initialized"));
+    }
+
+    // Verify pads are linked
+    let pads_linked = source.pads().iter().any(|pad| pad.is_linked());
+    if !pads_linked {
+        log::warn!("Transcoding pipeline: appsrc pads not yet linked (this may be expected)");
+    }
+
+    log::debug!("Transcoding pipeline built and validated successfully");
     Ok(source)
 }
 
