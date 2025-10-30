@@ -916,11 +916,15 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
     log::debug!("Transcode device config: {}", device_config);
 
     // Parse the device configuration
-    let (encoder_preference, allow_fallback) = match device_config {
+    // Returns: (encoder_type, allow_fallback_to_software, optional_device_path)
+    // Device path is used to specify a specific GPU device like /dev/dri/renderD128
+    let (encoder_preference, allow_fallback, device_path) = match device_config {
         "auto" => {
             // Auto mode: Test VAAPI, use if available, fall back to software
             log::debug!("Auto-detecting encoder (VAAPI preferred, will fallback to software)");
 
+            // Cache the VAAPI test result to avoid repeated testing (expensive operation)
+            // This is safe because VAAPI availability doesn't change during runtime
             static VAAPI_TESTED: std::sync::Once = std::sync::Once::new();
             static mut VAAPI_AVAILABLE: bool = false;
 
@@ -932,25 +936,25 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
 
             let use_vaapi = unsafe { VAAPI_AVAILABLE };
             if use_vaapi {
-                (H264EncoderType::VAAPI, true)
+                (H264EncoderType::VAAPI, true, None)
             } else {
-                (H264EncoderType::Software, false)
+                (H264EncoderType::Software, false, None)
             }
         }
         "vaapi" => {
             // Force VAAPI mode: No fallback
             log::info!("Forced to use VAAPI encoder (no fallback to software)");
-            (H264EncoderType::VAAPI, false)
+            (H264EncoderType::VAAPI, false, None)
         }
         "x264" | "software" => {
             // Force software mode: Skip VAAPI entirely
             log::info!("Forced to use software encoder (x264enc)");
-            (H264EncoderType::Software, false)
+            (H264EncoderType::Software, false, None)
         }
         path if path.starts_with("/dev/dri/") => {
             // Specific device path: Use VAAPI with custom device, no fallback
             log::info!("Using VAAPI with device path: {}", path);
-            (H264EncoderType::VAAPI, false)
+            (H264EncoderType::VAAPI, false, Some(path.to_string()))
         }
         unknown => {
             // Unknown config: Warn and use auto mode
@@ -967,9 +971,9 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
 
             let use_vaapi = unsafe { VAAPI_AVAILABLE_FALLBACK };
             if use_vaapi {
-                (H264EncoderType::VAAPI, true)
+                (H264EncoderType::VAAPI, true, None)
             } else {
-                (H264EncoderType::Software, false)
+                (H264EncoderType::Software, false, None)
             }
         }
     };
@@ -978,39 +982,56 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
     log::info!("Attempting to build pipeline with {:?} encoder (fallback {})",
         encoder_preference, if allow_fallback { "enabled" } else { "disabled" });
 
-    match build_h265_to_h264_transcode_with_encoder(bin, stream_config, encoder_preference) {
+    match build_h265_to_h264_transcode_with_encoder(bin, stream_config, encoder_preference, device_path.as_deref()) {
         Ok(source) => {
             log::info!("Transcoding pipeline built successfully with {:?} encoder", encoder_preference);
             Ok(source)
         }
         Err(e) if matches!(encoder_preference, H264EncoderType::VAAPI) && allow_fallback => {
             // VAAPI failed and fallback is allowed, try software encoding
-            log::error!("VAAPI transcoding pipeline failed to initialize: {}", e);
-            log::info!("Falling back to software encoder (x264enc)");
+            log::error!("VAAPI hardware transcoding failed: {}", e);
+            log::error!("This usually means:");
+            log::error!("  - VAAPI drivers are not properly installed");
+            log::error!("  - The GPU device is not accessible (check /dev/dri/ permissions)");
+            log::error!("  - GStreamer VAAPI plugins are missing (gstreamer-vaapi package)");
+            log::info!("Falling back to software encoder (x264enc) - this will use more CPU");
 
-            match build_h265_to_h264_transcode_with_encoder(bin, stream_config, H264EncoderType::Software) {
+            match build_h265_to_h264_transcode_with_encoder(bin, stream_config, H264EncoderType::Software, None) {
                 Ok(source) => {
                     log::info!("Successfully fell back to software encoding");
                     Ok(source)
                 }
                 Err(e2) => {
-                    log::error!("Software encoding also failed: {}", e2);
+                    log::error!("Software encoding (x264enc) also failed: {}", e2);
+                    log::error!("This indicates a serious GStreamer configuration issue");
+                    log::error!("Check that gst-plugins-ugly (x264enc) is installed");
                     Err(anyhow!("Both VAAPI and software transcoding failed. VAAPI: {}. Software: {}", e, e2))
                 }
             }
         }
         Err(e) => {
             // Either not VAAPI, or VAAPI with no fallback allowed
-            log::error!("Transcoding pipeline failed: {}", e);
-            if matches!(encoder_preference, H264EncoderType::VAAPI) && !allow_fallback {
-                log::error!("VAAPI was forced (no fallback). Consider using transcode_device = \"auto\" to enable fallback.");
+            if matches!(encoder_preference, H264EncoderType::VAAPI) {
+                log::error!("VAAPI hardware transcoding failed: {}", e);
+                log::error!("VAAPI was forced (transcode_device = \"vaapi\" or specific device path)");
+                log::error!("Troubleshooting steps:");
+                log::error!("  1. Check VAAPI drivers: vainfo (should show supported profiles)");
+                log::error!("  2. Check device permissions: ls -l /dev/dri/ (should be accessible)");
+                log::error!("  3. Check GStreamer plugins: gst-inspect-1.0 vaapih264enc");
+                log::error!("  4. Consider using transcode_device = \"auto\" to enable software fallback");
+                if device_path.is_some() {
+                    log::error!("  5. Verify the specified device path is correct");
+                }
+            } else {
+                log::error!("Software transcoding pipeline failed: {}", e);
+                log::error!("Check that gst-plugins-ugly (x264enc) is installed");
             }
             Err(e)
         }
     }
 }
 
-fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &StreamConfig, encoder_type: H264EncoderType) -> Result<AppSrc> {
+fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &StreamConfig, encoder_type: H264EncoderType, device_path: Option<&str>) -> Result<AppSrc> {
     let buffer_size = buffer_size(stream_config.bitrate);
     let bin_clone = bin
         .clone()
@@ -1077,7 +1098,16 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
         H264EncoderType::VAAPI => {
             log::debug!("Creating VAAPI hardware encoder");
             let enc = make_element("vaapih264enc", "h264encoder")
-                .map_err(|e| anyhow!("Failed to create VAAPI encoder: {}", e))?;
+                .map_err(|e| {
+                    anyhow!("Failed to create VAAPI encoder element: {}. \
+                    Check that gstreamer-vaapi package is installed and VAAPI drivers are available.", e)
+                })?;
+
+            // Set device path if specified
+            if let Some(device) = device_path {
+                log::info!("Configuring VAAPI encoder to use device: {}", device);
+                enc.set_property("device", device);
+            }
 
             // Validate encoder parameters before setting them
             let bitrate_kbps = stream_config.bitrate / 1000;
@@ -1158,28 +1188,20 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
         anyhow!("Pipeline linking failed: {:?}", e)
     })?;
 
-    // Verify that the source element is properly added to the bin
-    // and has a valid bus (indicating it's part of a functioning pipeline)
-    if source.bus().is_none() {
-        log::error!("Transcoding pipeline: appsrc has no bus after linking");
-        return Err(anyhow!("Pipeline construction failed: appsrc not properly initialized"));
-    }
+    // Note: We CANNOT validate the pipeline here because this bin hasn't been added
+    // to the RTSP server's pipeline yet. GStreamer bins only have a bus when they're
+    // part of a top-level Pipeline element or already integrated into the pipeline hierarchy.
+    //
+    // Validation happens at two other stages:
+    // 1. BEFORE construction: test_vaapi_encoder() tests if VAAPI works (lines 670-740)
+    // 2. AFTER RTSP integration: check_live() verifies the appsrc after the RTSP server
+    //    initializes the pipeline (called at line 267)
+    //
+    // GStreamer will also perform its own validation during state transitions (NULL->READY->PLAYING)
+    // which happens after the RTSP server receives this bin.
 
-    // Verify pads are linked
-    let pads_linked = source.pads().iter().any(|pad| pad.is_linked());
-    if !pads_linked {
-        log::warn!("Transcoding pipeline: appsrc pads not yet linked (this may be expected)");
-    }
-
-    // Test the pipeline initialization by monitoring for errors
-    // This will catch VAAPI initialization failures and other issues
-    log::debug!("Testing pipeline initialization with {:?} encoder...", encoder_type);
-    if let Err(e) = test_pipeline_initialization(&bin_clone, 300) {
-        log::error!("Pipeline initialization test failed: {}", e);
-        return Err(anyhow!("Pipeline failed initialization test: {}", e));
-    }
-
-    log::debug!("Transcoding pipeline built and validated successfully with {:?} encoder", encoder_type);
+    log::debug!("Transcoding pipeline constructed with {:?} encoder", encoder_type);
+    log::debug!("Pipeline elements created and linked - validation will occur during RTSP server initialization");
     Ok(source)
 }
 
