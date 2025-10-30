@@ -167,12 +167,13 @@ pub(super) async fn make_factory(
         while let Some(msg) = client_rx.recv().await {
             match msg {
                 ClientMsg::NewClient { element, reply } => {
-                    log::debug!("New client for {name}::{stream}");
+                    log::info!("New RTSP client connection for {name}::{stream} - creating pipeline");
                     let camera = camera.clone();
                     let name = name.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
+                        log::debug!("{name}::{stream}: Pipeline lifecycle: CREATED");
 
                         // Start the camera
                         let config = camera.config().await?.borrow().clone();
@@ -254,6 +255,10 @@ pub(super) async fn make_factory(
                         }
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
+                        // Clone the element bin so we can clean it up later
+                        // The RTSP server will own the original, but we need a reference for cleanup
+                        let element_for_cleanup = element.clone();
+
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
 
@@ -285,6 +290,31 @@ pub(super) async fn make_factory(
                             let mut vid_ts = 0u32;
                             let mut pools = Default::default();
 
+                            // Helper to cleanup appsrc elements and release VAAPI resources
+                            let cleanup_sources = |vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>| {
+                                log::debug!("{name}::{stream}: Cleaning up pipeline sources");
+
+                                if let Some(vid) = vid_src.as_ref() {
+                                    // Send EOS to signal end of stream
+                                    let _ = vid.end_of_stream();
+                                    // Set to NULL state to release GPU/VAAPI resources
+                                    if let Err(e) = vid.set_state(gstreamer::State::Null) {
+                                        log::warn!("{name}::{stream}: Failed to set video appsrc to NULL: {:?}", e);
+                                    } else {
+                                        log::trace!("{name}::{stream}: Video appsrc cleaned up");
+                                    }
+                                }
+
+                                if let Some(aud) = aud_src.as_ref() {
+                                    let _ = aud.end_of_stream();
+                                    if let Err(e) = aud.set_state(gstreamer::State::Null) {
+                                        log::warn!("{name}::{stream}: Failed to set audio appsrc to NULL: {:?}", e);
+                                    } else {
+                                        log::trace!("{name}::{stream}: Audio appsrc cleaned up");
+                                    }
+                                }
+                            };
+
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 if let Err(e) = send_to_sources(
@@ -299,36 +329,45 @@ pub(super) async fn make_factory(
                                     log::error!(
                                         "{name}::{stream}: Error sending buffered frame: {e:?}"
                                     );
+                                    // Cleanup before returning error
+                                    cleanup_sources(&vid_src, &aud_src);
                                     return Err(e);
                                 }
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                match send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                ) {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        log::info!(
-                                            "{name}::{stream}: Failed to send to source: {e:?}"
-                                        );
-                                        return Err(e);
+                            let streaming_result = (|| {
+                                while let Some(data) = media_rx.blocking_recv() {
+                                    match send_to_sources(
+                                        data,
+                                        &mut pools,
+                                        &vid_src,
+                                        &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
+                                        &stream_config,
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            log::info!(
+                                                "{name}::{stream}: Failed to send to source: {e:?}"
+                                            );
+                                            return Err(e);
+                                        }
                                     }
                                 }
-                            }
-                            log::trace!("{name}::{stream}: All media received, streaming ended");
-                            AnyResult::Ok(())
+                                log::trace!("{name}::{stream}: All media received, streaming ended");
+                                AnyResult::Ok(())
+                            })();
+
+                            // Always cleanup sources, regardless of success or failure
+                            cleanup_sources(&vid_src, &aud_src);
+
+                            streaming_result
                         });
 
                         // Wait for the streaming task to complete and propagate errors
-                        match stream_handle.await {
+                        let stream_result = match stream_handle.await {
                             Ok(Ok(())) => {
                                 log::debug!("{name_clone}::{stream_clone}: Streaming completed successfully");
                                 AnyResult::Ok(())
@@ -341,7 +380,32 @@ pub(super) async fn make_factory(
                                 log::error!("{name_clone}::{stream_clone}: Streaming task panicked: {e:?}");
                                 Err(anyhow!("Streaming task panicked: {e:?}"))
                             }
+                        };
+
+                        // Cleanup the pipeline bin to release VAAPI/GPU resources
+                        // This is critical to prevent resource leaks when streams end
+                        log::debug!("{name_clone}::{stream_clone}: Pipeline lifecycle: ENDING - cleaning up resources");
+                        if let Ok(bin) = element_for_cleanup.dynamic_cast::<Bin>() {
+                            // Set bin to NULL state to release all elements and VAAPI resources
+                            match bin.set_state(gstreamer::State::Null) {
+                                Ok(_) => {
+                                    // Wait for state change to complete
+                                    let (result, current, _) = bin.state(gstreamer::ClockTime::from_mseconds(1000));
+                                    if result.is_ok() && current == gstreamer::State::Null {
+                                        log::info!("{name_clone}::{stream_clone}: Pipeline lifecycle: DESTROYED - all resources released");
+                                    } else {
+                                        log::warn!("{name_clone}::{stream_clone}: Pipeline lifecycle: CLEANUP_INCOMPLETE - state={:?}", current);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("{name_clone}::{stream_clone}: Pipeline lifecycle: CLEANUP_FAILED - {:?}", e);
+                                }
+                            }
+                        } else {
+                            log::error!("{name_clone}::{stream_clone}: Pipeline lifecycle: CLEANUP_ERROR - could not cast to Bin");
                         }
+
+                        stream_result
                     });
                 }
             }
@@ -695,6 +759,28 @@ fn test_specific_vaapi_encoder(encoder_name: &str, encoder_desc: &str) -> Result
         .name("vaapi_test")
         .build();
 
+    // Helper to ensure cleanup always happens
+    let cleanup_pipeline = |pipeline: &gstreamer::Pipeline| {
+        log::trace!("Cleaning up {} test pipeline", encoder_desc);
+
+        // Set to NULL to release VAAPI resources
+        match pipeline.set_state(gstreamer::State::Null) {
+            Ok(_) => {
+                // Wait for NULL state to be reached (important for VAAPI resource cleanup)
+                let (result, current, _) = pipeline.state(gstreamer::ClockTime::from_mseconds(500));
+                if result.is_err() || current != gstreamer::State::Null {
+                    log::warn!("{} test pipeline cleanup incomplete: state={:?}, result={:?}",
+                        encoder_desc, current, result);
+                } else {
+                    log::trace!("{} test pipeline cleaned up successfully", encoder_desc);
+                }
+            }
+            Err(e) => {
+                log::warn!("{} test pipeline failed to set NULL state: {:?}", encoder_desc, e);
+            }
+        }
+    };
+
     // Create test elements
     let videotestsrc = make_element("videotestsrc", "test_src")?;
     let videoconvert = make_element("videoconvert", "test_convert")?;
@@ -714,18 +800,23 @@ fn test_specific_vaapi_encoder(encoder_name: &str, encoder_desc: &str) -> Result
     let state_change = pipeline.set_state(gstreamer::State::Ready);
     if state_change.is_err() {
         log::debug!("{} encoder failed to reach READY state", encoder_desc);
+        cleanup_pipeline(&pipeline);
         return Err(anyhow!("State change to READY failed"));
     }
 
     // Monitor bus for errors
     if let Some(bin) = pipeline.dynamic_cast_ref::<Bin>() {
-        test_pipeline_initialization(bin, 100)?;
+        if let Err(e) = test_pipeline_initialization(bin, 100) {
+            cleanup_pipeline(&pipeline);
+            return Err(e);
+        }
     }
 
     // Try to transition to PAUSED (encoder will be fully initialized)
     let state_change = pipeline.set_state(gstreamer::State::Paused);
     if state_change.is_err() {
         log::debug!("{} encoder failed to reach PAUSED state", encoder_desc);
+        cleanup_pipeline(&pipeline);
         return Err(anyhow!("State change to PAUSED failed"));
     }
 
@@ -736,11 +827,12 @@ fn test_specific_vaapi_encoder(encoder_name: &str, encoder_desc: &str) -> Result
     let (result, current, _pending) = pipeline.state(gstreamer::ClockTime::from_mseconds(100));
     if result.is_err() || current != gstreamer::State::Paused {
         log::debug!("{} encoder state check failed: {:?}, current: {:?}", encoder_desc, result, current);
+        cleanup_pipeline(&pipeline);
         return Err(anyhow!("Failed to reach PAUSED state"));
     }
 
-    // Clean up
-    let _ = pipeline.set_state(gstreamer::State::Null);
+    // Clean up - this MUST happen to release VAAPI resources
+    cleanup_pipeline(&pipeline);
 
     log::debug!("{} encoder test successful", encoder_desc);
     Ok(())
@@ -912,6 +1004,18 @@ enum H264EncoderType {
     Software,
 }
 
+/// Cached VAAPI availability test result
+/// Uses OnceLock for thread-safe lazy initialization without unsafe code
+fn is_vaapi_available() -> bool {
+    use std::sync::OnceLock;
+    static VAAPI_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+    *VAAPI_AVAILABLE.get_or_init(|| {
+        log::debug!("Testing VAAPI availability (cached for future calls)");
+        test_vaapi_encoder()
+    })
+}
+
 fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
     log::info!("Building H.265 to H.264 transcoding pipeline");
 
@@ -930,19 +1034,7 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
             // Auto mode: Test VAAPI, use if available, fall back to software
             log::debug!("Auto-detecting encoder (VAAPI preferred, will fallback to software)");
 
-            // Cache the VAAPI test result to avoid repeated testing (expensive operation)
-            // This is safe because VAAPI availability doesn't change during runtime
-            static VAAPI_TESTED: std::sync::Once = std::sync::Once::new();
-            static mut VAAPI_AVAILABLE: bool = false;
-
-            VAAPI_TESTED.call_once(|| {
-                unsafe {
-                    VAAPI_AVAILABLE = test_vaapi_encoder();
-                }
-            });
-
-            let use_vaapi = unsafe { VAAPI_AVAILABLE };
-            if use_vaapi {
+            if is_vaapi_available() {
                 (H264EncoderType::VAAPI, true, None)
             } else {
                 (H264EncoderType::Software, false, None)
@@ -967,17 +1059,7 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
             // Unknown config: Warn and use auto mode
             log::warn!("Unknown transcode_device value '{}', using auto-detection", unknown);
 
-            static VAAPI_TESTED_FALLBACK: std::sync::Once = std::sync::Once::new();
-            static mut VAAPI_AVAILABLE_FALLBACK: bool = false;
-
-            VAAPI_TESTED_FALLBACK.call_once(|| {
-                unsafe {
-                    VAAPI_AVAILABLE_FALLBACK = test_vaapi_encoder();
-                }
-            });
-
-            let use_vaapi = unsafe { VAAPI_AVAILABLE_FALLBACK };
-            if use_vaapi {
+            if is_vaapi_available() {
                 (H264EncoderType::VAAPI, true, None)
             } else {
                 (H264EncoderType::Software, false, None)
