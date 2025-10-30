@@ -836,21 +836,13 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
                 log::warn!("VAAPI encoder: Adjusting keyframe-period from {} to {}", keyframe_period, safe_keyframe);
             }
 
-            // Try to configure VAAPI encoder - if any step fails, fall back to software
-            if let Err(e) = enc.set_property_from_str("rate-control", "cbr") {
-                log::error!("VAAPI encoder: Failed to set rate-control: {:?}", e);
-                log::warn!("Falling back to x264enc software encoder");
-            } else if let Err(e) = enc.set_property("bitrate", safe_bitrate) {
-                log::error!("VAAPI encoder: Failed to set bitrate: {:?}", e);
-                log::warn!("Falling back to x264enc software encoder");
-            } else if let Err(e) = enc.set_property("keyframe-period", safe_keyframe) {
-                log::error!("VAAPI encoder: Failed to set keyframe-period: {:?}", e);
-                log::warn!("Falling back to x264enc software encoder");
-            } else {
-                // VAAPI configured successfully
-                log::debug!("VAAPI encoder configured: bitrate={} kbps, keyframe-period={}", safe_bitrate, safe_keyframe);
-                break 'encoder_selection enc;
-            }
+            // Configure VAAPI encoder
+            enc.set_property_from_str("rate-control", "cbr");
+            enc.set_property("bitrate", safe_bitrate);
+            enc.set_property("keyframe-period", safe_keyframe);
+
+            log::debug!("VAAPI encoder configured: bitrate={} kbps, keyframe-period={}", safe_bitrate, safe_keyframe);
+            break 'encoder_selection enc;
         }
 
         // Fall back to x264enc software encoder
@@ -859,14 +851,10 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
             .map_err(|e| anyhow!("No H.264 encoder available (tried vaapih264enc and x264enc): {}", e))?;
 
         // Configure x264enc for low latency and quality balance
-        enc.set_property_from_str("tune", "zerolatency")
-            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?;
-        enc.set_property_from_str("speed-preset", "medium")
-            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?;
-        enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32)
-            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?; // Convert to kbps
-        enc.set_property("key-int-max", stream_config.fps * 2)
-            .map_err(|e| anyhow!("Failed to configure x264enc: {:?}", e))?; // GOP size: 2 seconds
+        enc.set_property_from_str("tune", "zerolatency");
+        enc.set_property_from_str("speed-preset", "medium");
+        enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32); // Convert to kbps
+        enc.set_property("key-int-max", stream_config.fps * 2); // GOP size: 2 seconds
 
         log::debug!("x264enc configured successfully");
         enc
