@@ -786,7 +786,7 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
         Ok(enc) => {
             log::info!("Using VAAPI hardware encoder for transcoding");
             // Configure vaapih264enc
-            enc.set_property("rate-control", 2u32); // CBR mode
+            enc.set_property_from_str("rate-control", "cbr"); // CBR mode
             enc.set_property("bitrate", (stream_config.bitrate / 1000) as u32); // Convert to kbps
             enc.set_property("keyframe-period", stream_config.fps * 2); // GOP size: 2 seconds
             enc
