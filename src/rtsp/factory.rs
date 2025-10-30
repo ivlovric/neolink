@@ -670,73 +670,80 @@ fn test_pipeline_initialization(bin: &Bin, timeout_ms: u64) -> Result<()> {
 fn test_vaapi_encoder() -> bool {
     log::debug!("Testing VAAPI H.264 encoder availability...");
 
-    // Try to create a simple test pipeline with VAAPI
-    let test_result = (|| -> Result<()> {
-        let pipeline = gstreamer::Pipeline::builder()
-            .name("vaapi_test")
-            .build();
-
-        // Create test elements
-        let videotestsrc = make_element("videotestsrc", "test_src")?;
-        let videoconvert = make_element("videoconvert", "test_convert")?;
-        let vaapi_enc = make_element("vaapih264enc", "test_vaapi_enc")?;
-        let fakesink = make_element("fakesink", "test_sink")?;
-
-        // Configure for quick test
-        videotestsrc.set_property("num-buffers", 1i32);
-
-        // Add to pipeline
-        pipeline.add_many([&videotestsrc, &videoconvert, &vaapi_enc, &fakesink])?;
-        Element::link_many([&videotestsrc, &videoconvert, &vaapi_enc, &fakesink])
-            .map_err(|e| anyhow!("Failed to link test pipeline: {:?}", e))?;
-
-        // Try to set to READY state (this will fail if VAAPI can't initialize)
-        let state_change = pipeline.set_state(gstreamer::State::Ready);
-        if state_change.is_err() {
-            log::debug!("VAAPI encoder failed to reach READY state");
-            return Err(anyhow!("State change to READY failed"));
-        }
-
-        // Monitor bus for errors
-        if let Some(bin) = pipeline.dynamic_cast_ref::<Bin>() {
-            test_pipeline_initialization(bin, 100)?;
-        }
-
-        // Try to transition to PAUSED (encoder will be fully initialized)
-        let state_change = pipeline.set_state(gstreamer::State::Paused);
-        if state_change.is_err() {
-            log::debug!("VAAPI encoder failed to reach PAUSED state");
-            return Err(anyhow!("State change to PAUSED failed"));
-        }
-
-        // Wait briefly for async state change
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Check final state
-        let (result, current, _pending) = pipeline.state(gstreamer::ClockTime::from_mseconds(100));
-        if result.is_err() || current != gstreamer::State::Paused {
-            log::debug!("VAAPI encoder state check failed: {:?}, current: {:?}", result, current);
-            return Err(anyhow!("Failed to reach PAUSED state"));
-        }
-
-        // Clean up
-        let _ = pipeline.set_state(gstreamer::State::Null);
-
-        log::debug!("VAAPI encoder test successful");
-        Ok(())
-    })();
-
-    match test_result {
-        Ok(_) => {
-            log::info!("VAAPI H.264 encoder is available and functional");
-            true
-        }
-        Err(e) => {
-            log::warn!("VAAPI H.264 encoder test failed: {}", e);
-            log::info!("Will use software encoding (x264enc) instead");
-            false
-        }
+    // Try new VA-API 2.0 encoder first
+    if let Ok(_) = test_specific_vaapi_encoder("vah264enc", "VA-API 2.0") {
+        log::info!("VA-API 2.0 H.264 encoder (vah264enc) is available and functional");
+        return true;
     }
+
+    // Fall back to testing legacy VAAPI encoder
+    if let Ok(_) = test_specific_vaapi_encoder("vaapih264enc", "legacy VAAPI") {
+        log::info!("Legacy VAAPI H.264 encoder (vaapih264enc) is available and functional");
+        return true;
+    }
+
+    log::warn!("No VAAPI H.264 encoders are available or functional");
+    log::info!("Will use software encoding (x264enc) instead");
+    false
+}
+
+/// Tests a specific VAAPI encoder by name
+fn test_specific_vaapi_encoder(encoder_name: &str, encoder_desc: &str) -> Result<()> {
+    log::debug!("Testing {} encoder...", encoder_desc);
+
+    let pipeline = gstreamer::Pipeline::builder()
+        .name("vaapi_test")
+        .build();
+
+    // Create test elements
+    let videotestsrc = make_element("videotestsrc", "test_src")?;
+    let videoconvert = make_element("videoconvert", "test_convert")?;
+    let vaapi_enc = make_element(encoder_name, "test_vaapi_enc")
+        .map_err(|e| anyhow!("{} encoder element not found: {}", encoder_desc, e))?;
+    let fakesink = make_element("fakesink", "test_sink")?;
+
+    // Configure for quick test
+    videotestsrc.set_property("num-buffers", 1i32);
+
+    // Add to pipeline
+    pipeline.add_many([&videotestsrc, &videoconvert, &vaapi_enc, &fakesink])?;
+    Element::link_many([&videotestsrc, &videoconvert, &vaapi_enc, &fakesink])
+        .map_err(|e| anyhow!("Failed to link test pipeline: {:?}", e))?;
+
+    // Try to set to READY state (this will fail if VAAPI can't initialize)
+    let state_change = pipeline.set_state(gstreamer::State::Ready);
+    if state_change.is_err() {
+        log::debug!("{} encoder failed to reach READY state", encoder_desc);
+        return Err(anyhow!("State change to READY failed"));
+    }
+
+    // Monitor bus for errors
+    if let Some(bin) = pipeline.dynamic_cast_ref::<Bin>() {
+        test_pipeline_initialization(bin, 100)?;
+    }
+
+    // Try to transition to PAUSED (encoder will be fully initialized)
+    let state_change = pipeline.set_state(gstreamer::State::Paused);
+    if state_change.is_err() {
+        log::debug!("{} encoder failed to reach PAUSED state", encoder_desc);
+        return Err(anyhow!("State change to PAUSED failed"));
+    }
+
+    // Wait briefly for async state change
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Check final state
+    let (result, current, _pending) = pipeline.state(gstreamer::ClockTime::from_mseconds(100));
+    if result.is_err() || current != gstreamer::State::Paused {
+        log::debug!("{} encoder state check failed: {:?}, current: {:?}", encoder_desc, result, current);
+        return Err(anyhow!("Failed to reach PAUSED state"));
+    }
+
+    // Clean up
+    let _ = pipeline.set_state(gstreamer::State::Null);
+
+    log::debug!("{} encoder test successful", encoder_desc);
+    Ok(())
 }
 
 fn clear_bin(bin: &Element) -> Result<()> {
@@ -1069,17 +1076,29 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
     let queue_in = make_queue("transcode_queue_in", buffer_size)?;
     let h265_parser = make_element("h265parse", "h265parser")?;
 
-    // Try avdec_h265 first, fall back to other decoders if needed
-    let decoder = match make_element("avdec_h265", "h265decoder") {
-        Ok(dec) => {
-            log::debug!("Using libav H.265 decoder: avdec_h265");
-            Ok(dec)
+    // Try hardware decoders first for better performance, then fall back to software
+    let decoder = {
+        // Try VA-API 2.0 hardware decoder first
+        if let Ok(dec) = make_element("vah265dec", "h265decoder") {
+            log::info!("Using VA-API 2.0 hardware H.265 decoder: vah265dec");
+            dec
         }
-        Err(_) => {
-            log::debug!("avdec_h265 not available, trying libde265dec");
-            make_element("libde265dec", "h265decoder")
+        // Try legacy VAAPI hardware decoder
+        else if let Ok(dec) = make_element("vaapih265dec", "h265decoder") {
+            log::info!("Using legacy VAAPI hardware H.265 decoder: vaapih265dec");
+            dec
         }
-    }?;
+        // Fall back to libav software decoder
+        else if let Ok(dec) = make_element("avdec_h265", "h265decoder") {
+            log::debug!("Using libav software H.265 decoder: avdec_h265");
+            dec
+        }
+        // Last resort: libde265 software decoder
+        else {
+            log::debug!("Trying libde265 software H.265 decoder");
+            make_element("libde265dec", "h265decoder")?
+        }
+    };
 
     // Add videoconvert to handle format conversion between decoder and encoder
     let videoconvert = make_element("videoconvert", "format_converter")?;
@@ -1097,16 +1116,38 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
     let encoder = match encoder_type {
         H264EncoderType::VAAPI => {
             log::debug!("Creating VAAPI hardware encoder");
-            let enc = make_element("vaapih264enc", "h264encoder")
-                .map_err(|e| {
-                    anyhow!("Failed to create VAAPI encoder element: {}. \
-                    Check that gstreamer-vaapi package is installed and VAAPI drivers are available.", e)
-                })?;
 
-            // Set device path if specified
+            // Try new VA-API 2.0 encoder first (supports device property)
+            // then fall back to old VAAPI encoder (doesn't support device property)
+            let (enc, is_new_vaapi) = match make_element("vah264enc", "h264encoder") {
+                Ok(enc) => {
+                    log::info!("Using new VA-API 2.0 encoder (vah264enc)");
+                    (enc, true)
+                }
+                Err(_) => {
+                    log::info!("VA-API 2.0 encoder not available, using legacy VAAPI encoder (vaapih264enc)");
+                    let enc = make_element("vaapih264enc", "h264encoder")
+                        .map_err(|e| {
+                            anyhow!("Failed to create VAAPI encoder element: {}. \
+                            Check that gstreamer-vaapi package is installed and VAAPI drivers are available.", e)
+                        })?;
+                    (enc, false)
+                }
+            };
+
+            // Set device path if specified (only supported by new VA-API 2.0)
             if let Some(device) = device_path {
-                log::info!("Configuring VAAPI encoder to use device: {}", device);
-                enc.set_property("device", device);
+                if is_new_vaapi {
+                    log::info!("Configuring VA-API 2.0 encoder to use device: {}", device);
+                    // The property name for vah264enc is "device-path" not "device"
+                    enc.set_property("device-path", device);
+                } else {
+                    log::warn!("Device path '{}' specified but legacy VAAPI encoder doesn't support device selection", device);
+                    log::warn!("The encoder will auto-detect the default device");
+                    log::warn!("To use a specific device, install GStreamer VA-API 2.0 (vah264enc) or use environment variables:");
+                    log::warn!("  LIBVA_DRIVER_NAME=iHD (for Intel iGPU)");
+                    log::warn!("  LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri");
+                }
             }
 
             // Validate encoder parameters before setting them
@@ -1125,12 +1166,21 @@ fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &Stre
                 log::warn!("VAAPI encoder: Adjusting keyframe-period from {} to {}", keyframe_period, safe_keyframe);
             }
 
-            // Configure VAAPI encoder
-            enc.set_property_from_str("rate-control", "cbr");
-            enc.set_property("bitrate", safe_bitrate);
-            enc.set_property("keyframe-period", safe_keyframe);
+            // Configure encoder (properties are similar between old and new VAAPI)
+            if is_new_vaapi {
+                // VA-API 2.0 properties
+                enc.set_property_from_str("rate-control", "cbr");
+                enc.set_property("bitrate", safe_bitrate);
+                enc.set_property("key-int-max", safe_keyframe as u32);
+                log::debug!("VA-API 2.0 encoder configured: bitrate={} kbps, key-int-max={}", safe_bitrate, safe_keyframe);
+            } else {
+                // Legacy VAAPI properties
+                enc.set_property_from_str("rate-control", "cbr");
+                enc.set_property("bitrate", safe_bitrate);
+                enc.set_property("keyframe-period", safe_keyframe);
+                log::debug!("Legacy VAAPI encoder configured: bitrate={} kbps, keyframe-period={}", safe_bitrate, safe_keyframe);
+            }
 
-            log::debug!("VAAPI encoder configured: bitrate={} kbps, keyframe-period={}", safe_bitrate, safe_keyframe);
             enc
         }
         H264EncoderType::Software => {
@@ -1480,8 +1530,13 @@ fn make_element(kind: &str, name: &str) -> AnyResult<Element> {
             "avdec_h264" => "libav (gst-libav)",
             "avdec_h265" => "libav (gst-libav)",
             "libde265dec" => "libde265 (gst-plugins-bad)",
-            "vaapih264enc" => "vaapi (gstreamer-vaapi)",
-            "vaapih265enc" => "vaapi (gstreamer-vaapi)",
+            "vah264dec" => "va (gstreamer-va, VA-API 2.0)",
+            "vah265dec" => "va (gstreamer-va, VA-API 2.0)",
+            "vaapih265dec" => "vaapi (gstreamer-vaapi, legacy)",
+            "vah264enc" => "va (gstreamer-va, VA-API 2.0)",
+            "vah265enc" => "va (gstreamer-va, VA-API 2.0)",
+            "vaapih264enc" => "vaapi (gstreamer-vaapi, legacy)",
+            "vaapih265enc" => "vaapi (gstreamer-vaapi, legacy)",
             "videotestsrc" => "videotestsrc (gst-plugins-base)",
             "imagefreeze" => "imagefreeze (gst-plugins-good)",
             "audiotestsrc" => "audiotestsrc (gst-plugins-base)",
