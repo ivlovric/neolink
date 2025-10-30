@@ -221,6 +221,9 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_transcode")]
     pub(crate) transcode_to: Option<String>,
+
+    #[serde(default = "default_transcode_device")]
+    pub(crate) transcode_device: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -519,6 +522,10 @@ fn default_splash() -> SplashPattern {
 
 fn default_transcode() -> Option<String> {
     None
+}
+
+fn default_transcode_device() -> Option<String> {
+    Some("auto".to_string())
 }
 
 pub(crate) static RESERVED_NAMES: &[&str] = &["anyone", "anonymous"];

@@ -4,6 +4,9 @@ services:
     image: ivlovric/neolink # If a specific version should be targetted, target it here with `:vx.x.x`
     command: ["/usr/local/bin/neolink", "rtsp", "--config=/etc/neolink.toml"]  # The NEO_LINK_MODE can be set by modifying this command
     container_name: neolink
+    privileged: true  # Required for hardware transcoding (GPU access)
+    devices:
+      - /dev/dri:/dev/dri  # GPU devices for hardware acceleration
     ports:
       - 8554:8554
     volumes:

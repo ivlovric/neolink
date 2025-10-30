@@ -64,23 +64,30 @@ LABEL maintainer="$OWNER"
 # i965-va-driver: Intel GPU driver (Broadwell through Coffee Lake, Gen 8-9)
 # intel-media-va-driver: Intel GPU driver (Broadwell+ optimized, Gen 8+)
 # mesa-va-drivers: AMD GPU driver and modern Intel fallback
-# hadolint ignore=DL3008
+# hadolint ignore=DL3008,DL3009
 RUN apt-get update && \
     apt-get upgrade -y && \
+    # Install base utilities and certificates first
     apt-get install -y --no-install-recommends \
         openssl \
         dnsutils \
         iputils-ping \
-        ca-certificates \
+        ca-certificates && \
+    # Install GStreamer core and basic plugins
+    apt-get install -y --no-install-recommends \
         libgstrtspserver-1.0-0 \
         libgstreamer1.0-0 \
         gstreamer1.0-tools \
         gstreamer1.0-x \
         gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-good && \
+    # Install additional GStreamer plugins
+    apt-get install -y --no-install-recommends \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly \
-        gstreamer1.0-libav \
+        gstreamer1.0-libav && \
+    # Install hardware acceleration drivers (optional)
+    apt-get install -y --no-install-recommends \
         gstreamer1.0-vaapi \
         i965-va-driver \
         intel-media-va-driver \

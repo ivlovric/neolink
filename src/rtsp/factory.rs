@@ -31,6 +31,7 @@ struct StreamConfig {
     vid_type: Option<VideoType>,
     aud_type: Option<AudioType>,
     transcode_to: Option<String>,
+    transcode_device: Option<String>,
 }
 impl StreamConfig {
     async fn new(instance: &NeoInstance, name: StreamKind) -> AnyResult<Self> {
@@ -94,6 +95,7 @@ impl StreamConfig {
             vid_type: None,
             aud_type: None,
             transcode_to: None,
+            transcode_device: None,
         })
     }
 
@@ -183,6 +185,7 @@ pub(super) async fn make_factory(
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
                         stream_config.transcode_to = config.transcode_to.clone();
+                        stream_config.transcode_device = config.transcode_device.clone();
                         while let Some(media) = media_rx.recv().await {
                             stream_config.update_from_media(&media);
                             buffer.push(media);
@@ -593,6 +596,146 @@ fn check_live(app: &AppSrc) -> Result<()> {
     Ok(())
 }
 
+/// Tests if a bin's pipeline can initialize properly by monitoring bus messages
+/// Returns Ok if pipeline initializes without errors, Err with details if it fails
+fn test_pipeline_initialization(bin: &Bin, timeout_ms: u64) -> Result<()> {
+    use gstreamer::MessageView;
+
+    // Get the pipeline's bus to monitor for errors
+    let bus = match bin.bus() {
+        Some(bus) => bus,
+        None => {
+            log::error!("Pipeline has no bus - cannot monitor initialization");
+            return Err(anyhow!("No bus available for pipeline monitoring"));
+        }
+    };
+
+    log::debug!("Monitoring pipeline bus for {} ms", timeout_ms);
+
+    // Check for error and warning messages during initialization
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < timeout_ms as u128 {
+        // Pop messages with timeout
+        if let Some(msg) = bus.timed_pop(gstreamer::ClockTime::from_mseconds(10)) {
+            match msg.view() {
+                MessageView::Error(err) => {
+                    let error_msg = err.error().to_string();
+                    let debug_info = err.debug().unwrap_or_else(|| "No debug info".into());
+                    let src_name = msg.src().map(|s| s.name()).unwrap_or_else(|| "Unknown".into());
+
+                    log::error!("GStreamer ERROR from {}: {}", src_name, error_msg);
+                    log::error!("Debug info: {}", debug_info);
+
+                    return Err(anyhow!(
+                        "Pipeline initialization failed: {} (from {})\nDebug: {}",
+                        error_msg, src_name, debug_info
+                    ));
+                }
+                MessageView::Warning(warn) => {
+                    let warning_msg = warn.warning().to_string();
+                    let debug_info = warn.debug().unwrap_or_else(|| "No debug info".into());
+                    let src_name = msg.src().map(|s| s.name()).unwrap_or_else(|| "Unknown".into());
+
+                    log::warn!("GStreamer WARNING from {}: {}", src_name, warning_msg);
+                    log::debug!("Warning debug info: {}", debug_info);
+
+                    // Check for critical VAAPI warnings that indicate failure
+                    if warning_msg.contains("vaapi") || warning_msg.contains("VAAPI") {
+                        log::warn!("VAAPI warning detected - encoder may not work properly");
+                    }
+                }
+                MessageView::Info(info) => {
+                    log::trace!("GStreamer info: {}", info.message().to_string());
+                }
+                MessageView::StateChanged(sc) => {
+                    if let Some(src) = msg.src() {
+                        log::trace!("Element {} state changed: {:?} -> {:?}",
+                            src.name(), sc.old(), sc.current());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    log::debug!("Pipeline initialization monitoring completed - no errors detected");
+    Ok(())
+}
+
+/// Tests if VAAPI H.264 encoder is available and functional
+/// Returns true if VAAPI works, false if it should be avoided
+fn test_vaapi_encoder() -> bool {
+    log::debug!("Testing VAAPI H.264 encoder availability...");
+
+    // Try to create a simple test pipeline with VAAPI
+    let test_result = (|| -> Result<()> {
+        let pipeline = gstreamer::Pipeline::new(Some("vaapi_test"));
+
+        // Create test elements
+        let videotestsrc = make_element("videotestsrc", "test_src")?;
+        let videoconvert = make_element("videoconvert", "test_convert")?;
+        let vaapi_enc = make_element("vaapih264enc", "test_vaapi_enc")?;
+        let fakesink = make_element("fakesink", "test_sink")?;
+
+        // Configure for quick test
+        videotestsrc.set_property("num-buffers", 1i32);
+
+        // Add to pipeline
+        pipeline.add_many([&videotestsrc, &videoconvert, &vaapi_enc, &fakesink])?;
+        Element::link_many([&videotestsrc, &videoconvert, &vaapi_enc, &fakesink])
+            .map_err(|e| anyhow!("Failed to link test pipeline: {:?}", e))?;
+
+        // Try to set to READY state (this will fail if VAAPI can't initialize)
+        let state_change = pipeline.set_state(gstreamer::State::Ready);
+        if state_change.is_err() {
+            log::debug!("VAAPI encoder failed to reach READY state");
+            return Err(anyhow!("State change to READY failed"));
+        }
+
+        // Monitor bus for errors
+        if let Some(bin) = pipeline.dynamic_cast_ref::<Bin>() {
+            test_pipeline_initialization(bin, 100)?;
+        }
+
+        // Try to transition to PAUSED (encoder will be fully initialized)
+        let state_change = pipeline.set_state(gstreamer::State::Paused);
+        if state_change.is_err() {
+            log::debug!("VAAPI encoder failed to reach PAUSED state");
+            return Err(anyhow!("State change to PAUSED failed"));
+        }
+
+        // Wait briefly for async state change
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Check final state
+        let (result, current, _pending) = pipeline.state(gstreamer::ClockTime::from_mseconds(100));
+        if result.is_err() || current != gstreamer::State::Paused {
+            log::debug!("VAAPI encoder state check failed: {:?}, current: {:?}", result, current);
+            return Err(anyhow!("Failed to reach PAUSED state"));
+        }
+
+        // Clean up
+        let _ = pipeline.set_state(gstreamer::State::Null);
+
+        log::debug!("VAAPI encoder test successful");
+        Ok(())
+    })();
+
+    match test_result {
+        Ok(_) => {
+            log::info!("VAAPI H.264 encoder is available and functional");
+            true
+        }
+        Err(e) => {
+            log::warn!("VAAPI H.264 encoder test failed: {}", e);
+            log::info!("Will use software encoding (x264enc) instead");
+            false
+        }
+    }
+}
+
 fn clear_bin(bin: &Element) -> Result<()> {
     let bin = bin
         .clone()
@@ -752,14 +895,126 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
     Ok(linked.appsrc)
 }
 
+/// Enum to specify which encoder to use for transcoding
+#[derive(Debug, Clone, Copy)]
+enum H264EncoderType {
+    VAAPI,
+    Software,
+}
+
 fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
+    log::info!("Building H.265 to H.264 transcoding pipeline");
+
+    // Determine encoder selection based on transcode_device config
+    let device_config = stream_config.transcode_device.as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("auto");
+
+    log::debug!("Transcode device config: {}", device_config);
+
+    // Parse the device configuration
+    let (encoder_preference, allow_fallback) = match device_config {
+        "auto" => {
+            // Auto mode: Test VAAPI, use if available, fall back to software
+            log::debug!("Auto-detecting encoder (VAAPI preferred, will fallback to software)");
+
+            static VAAPI_TESTED: std::sync::Once = std::sync::Once::new();
+            static mut VAAPI_AVAILABLE: bool = false;
+
+            VAAPI_TESTED.call_once(|| {
+                unsafe {
+                    VAAPI_AVAILABLE = test_vaapi_encoder();
+                }
+            });
+
+            let use_vaapi = unsafe { VAAPI_AVAILABLE };
+            if use_vaapi {
+                (H264EncoderType::VAAPI, true)
+            } else {
+                (H264EncoderType::Software, false)
+            }
+        }
+        "vaapi" => {
+            // Force VAAPI mode: No fallback
+            log::info!("Forced to use VAAPI encoder (no fallback to software)");
+            (H264EncoderType::VAAPI, false)
+        }
+        "x264" | "software" => {
+            // Force software mode: Skip VAAPI entirely
+            log::info!("Forced to use software encoder (x264enc)");
+            (H264EncoderType::Software, false)
+        }
+        path if path.starts_with("/dev/dri/") => {
+            // Specific device path: Use VAAPI with custom device, no fallback
+            log::info!("Using VAAPI with device path: {}", path);
+            (H264EncoderType::VAAPI, false)
+        }
+        unknown => {
+            // Unknown config: Warn and use auto mode
+            log::warn!("Unknown transcode_device value '{}', using auto-detection", unknown);
+
+            static VAAPI_TESTED_FALLBACK: std::sync::Once = std::sync::Once::new();
+            static mut VAAPI_AVAILABLE_FALLBACK: bool = false;
+
+            VAAPI_TESTED_FALLBACK.call_once(|| {
+                unsafe {
+                    VAAPI_AVAILABLE_FALLBACK = test_vaapi_encoder();
+                }
+            });
+
+            let use_vaapi = unsafe { VAAPI_AVAILABLE_FALLBACK };
+            if use_vaapi {
+                (H264EncoderType::VAAPI, true)
+            } else {
+                (H264EncoderType::Software, false)
+            }
+        }
+    };
+
+    // Build the pipeline with the selected encoder
+    log::info!("Attempting to build pipeline with {:?} encoder (fallback {})",
+        encoder_preference, if allow_fallback { "enabled" } else { "disabled" });
+
+    match build_h265_to_h264_transcode_with_encoder(bin, stream_config, encoder_preference) {
+        Ok(source) => {
+            log::info!("Transcoding pipeline built successfully with {:?} encoder", encoder_preference);
+            Ok(source)
+        }
+        Err(e) if matches!(encoder_preference, H264EncoderType::VAAPI) && allow_fallback => {
+            // VAAPI failed and fallback is allowed, try software encoding
+            log::error!("VAAPI transcoding pipeline failed to initialize: {}", e);
+            log::info!("Falling back to software encoder (x264enc)");
+
+            match build_h265_to_h264_transcode_with_encoder(bin, stream_config, H264EncoderType::Software) {
+                Ok(source) => {
+                    log::info!("Successfully fell back to software encoding");
+                    Ok(source)
+                }
+                Err(e2) => {
+                    log::error!("Software encoding also failed: {}", e2);
+                    Err(anyhow!("Both VAAPI and software transcoding failed. VAAPI: {}. Software: {}", e, e2))
+                }
+            }
+        }
+        Err(e) => {
+            // Either not VAAPI, or VAAPI with no fallback allowed
+            log::error!("Transcoding pipeline failed: {}", e);
+            if matches!(encoder_preference, H264EncoderType::VAAPI) && !allow_fallback {
+                log::error!("VAAPI was forced (no fallback). Consider using transcode_device = \"auto\" to enable fallback.");
+            }
+            Err(e)
+        }
+    }
+}
+
+fn build_h265_to_h264_transcode_with_encoder(bin: &Element, stream_config: &StreamConfig, encoder_type: H264EncoderType) -> Result<AppSrc> {
     let buffer_size = buffer_size(stream_config.bitrate);
     let bin_clone = bin
         .clone()
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
 
-    log::debug!("Building H.265 to H.264 transcoding pipeline");
+    log::debug!("Building H.265 to H.264 transcoding pipeline with {:?} encoder", encoder_type);
 
     // Create the appsrc for H.265 input
     let source = make_element("appsrc", "vidsrc")?
@@ -814,11 +1069,12 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
             .build(),
     );
 
-    // H.264 encoder - try hardware encoders first, fall back to software
-    // Attempt VAAPI first
-    let encoder = 'encoder_selection: {
-        if let Ok(enc) = make_element("vaapih264enc", "h264encoder") {
-            log::info!("Using VAAPI hardware encoder for transcoding");
+    // H.264 encoder - use the specified encoder type
+    let encoder = match encoder_type {
+        H264EncoderType::VAAPI => {
+            log::debug!("Creating VAAPI hardware encoder");
+            let enc = make_element("vaapih264enc", "h264encoder")
+                .map_err(|e| anyhow!("Failed to create VAAPI encoder: {}", e))?;
 
             // Validate encoder parameters before setting them
             let bitrate_kbps = stream_config.bitrate / 1000;
@@ -842,22 +1098,23 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
             enc.set_property("keyframe-period", safe_keyframe);
 
             log::debug!("VAAPI encoder configured: bitrate={} kbps, keyframe-period={}", safe_bitrate, safe_keyframe);
-            break 'encoder_selection enc;
+            enc
         }
+        H264EncoderType::Software => {
+            log::debug!("Creating x264enc software encoder");
+            let enc = make_element("x264enc", "h264encoder")
+                .map_err(|e| anyhow!("Failed to create x264enc encoder: {}", e))?;
 
-        // Fall back to x264enc software encoder
-        log::info!("Using x264enc software encoder for transcoding");
-        let enc = make_element("x264enc", "h264encoder")
-            .map_err(|e| anyhow!("No H.264 encoder available (tried vaapih264enc and x264enc): {}", e))?;
+            // Configure x264enc for low latency and quality balance
+            enc.set_property_from_str("tune", "zerolatency");
+            enc.set_property_from_str("speed-preset", "medium");
+            enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32); // Convert to kbps
+            enc.set_property("key-int-max", stream_config.fps * 2); // GOP size: 2 seconds
 
-        // Configure x264enc for low latency and quality balance
-        enc.set_property_from_str("tune", "zerolatency");
-        enc.set_property_from_str("speed-preset", "medium");
-        enc.set_property("bitrate", (stream_config.bitrate / 1024) as u32); // Convert to kbps
-        enc.set_property("key-int-max", stream_config.fps * 2); // GOP size: 2 seconds
-
-        log::debug!("x264enc configured successfully");
-        enc
+            log::debug!("x264enc configured: bitrate={} kbps, key-int-max={}",
+                stream_config.bitrate / 1024, stream_config.fps * 2);
+            enc
+        }
     };
 
     let queue_out = make_queue("transcode_queue_out", buffer_size)?;
@@ -911,7 +1168,15 @@ fn build_h265_to_h264_transcode(bin: &Element, stream_config: &StreamConfig) -> 
         log::warn!("Transcoding pipeline: appsrc pads not yet linked (this may be expected)");
     }
 
-    log::debug!("Transcoding pipeline built and validated successfully");
+    // Test the pipeline initialization by monitoring for errors
+    // This will catch VAAPI initialization failures and other issues
+    log::debug!("Testing pipeline initialization with {:?} encoder...", encoder_type);
+    if let Err(e) = test_pipeline_initialization(&bin_clone, 300) {
+        log::error!("Pipeline initialization test failed: {}", e);
+        return Err(anyhow!("Pipeline failed initialization test: {}", e));
+    }
+
+    log::debug!("Transcoding pipeline built and validated successfully with {:?} encoder", encoder_type);
     Ok(source)
 }
 
@@ -1336,6 +1601,7 @@ mod tests {
             vid_type: None,
             aud_type: None,
             transcode_to: None,
+            transcode_device: None,
         };
 
         // Test FPS update from table
@@ -1358,6 +1624,7 @@ mod tests {
             vid_type: None,
             aud_type: None,
             transcode_to: None,
+            transcode_device: None,
         };
 
         // Test bitrate update from table
