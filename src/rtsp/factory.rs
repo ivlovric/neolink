@@ -381,40 +381,50 @@ pub(super) async fn make_factory(
                             log::trace!("{name}::{stream}: Sending new frames");
                             let streaming_result = (|| {
                                 loop {
-                                    // Use blocking_recv_timeout to prevent zombie pipelines
+                                    // Use try_recv with timeout to prevent zombie pipelines
                                     // If camera disconnects, channel may hang forever without timeout
-                                    match media_rx.blocking_recv_timeout(Duration::from_secs(30)) {
-                                        Ok(data) => {
-                                            match send_to_sources(
-                                                data,
-                                                &mut pools,
-                                                &vid_src,
-                                                &aud_src,
-                                                &mut vid_ts,
-                                                &mut aud_ts,
-                                                &stream_config,
-                                            ) {
-                                                Ok(_) => {}
-                                                Err(e) => {
-                                                    log::info!(
-                                                        "{name}::{stream}: Failed to send to source: {e:?}"
+                                    let timeout = Duration::from_secs(30);
+                                    let start = std::time::Instant::now();
+
+                                    let data = loop {
+                                        match media_rx.try_recv() {
+                                            Ok(data) => break Some(data),
+                                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                                if start.elapsed() >= timeout {
+                                                    log::warn!(
+                                                        "{name}::{stream}: No frames received for 30s - camera may have disconnected"
                                                     );
-                                                    return Err(e);
+                                                    log::debug!(
+                                                        "{name}::{stream}: Exiting streaming task to prevent zombie pipeline"
+                                                    );
+                                                    return AnyResult::Ok(());
                                                 }
+                                                std::thread::sleep(Duration::from_millis(100));
+                                            }
+                                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                                log::trace!("{name}::{stream}: Media channel closed - streaming ended");
+                                                return AnyResult::Ok(());
                                             }
                                         }
-                                        Err(tokio::sync::mpsc::error::RecvTimeoutError::Timeout) => {
-                                            log::warn!(
-                                                "{name}::{stream}: No frames received for 30s - camera may have disconnected"
-                                            );
-                                            log::debug!(
-                                                "{name}::{stream}: Exiting streaming task to prevent zombie pipeline"
-                                            );
-                                            return AnyResult::Ok(());
-                                        }
-                                        Err(tokio::sync::mpsc::error::RecvTimeoutError::Closed) => {
-                                            log::trace!("{name}::{stream}: Media channel closed - streaming ended");
-                                            return AnyResult::Ok(());
+                                    };
+
+                                    if let Some(data) = data {
+                                        match send_to_sources(
+                                            data,
+                                            &mut pools,
+                                            &vid_src,
+                                            &aud_src,
+                                            &mut vid_ts,
+                                            &mut aud_ts,
+                                            &stream_config,
+                                        ) {
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                log::info!(
+                                                    "{name}::{stream}: Failed to send to source: {e:?}"
+                                                );
+                                                return Err(e);
+                                            }
                                         }
                                     }
                                 }

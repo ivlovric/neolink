@@ -144,7 +144,7 @@ impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
                 Ok(element) => element,
                 Err(e) => {
                     log::error!(
-                        "Failed to build pipeline for URL {}: {:?}. This may indicate resource exhaustion (VAAPI contexts, GPU memory, file descriptors).",
+                        "Failed to build pipeline for URL {:?}: {:?}. This may indicate resource exhaustion (VAAPI contexts, GPU memory, file descriptors).",
                         url, e
                     );
                     log::error!(
