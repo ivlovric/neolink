@@ -1,5 +1,5 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, sync::atomic::{AtomicUsize, Ordering}, time::Duration};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -160,6 +160,12 @@ pub(super) async fn make_factory(
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     // Increased from 100 to 200 to handle more concurrent client connections
     let (client_tx, mut client_rx) = mpsc(200);
+
+    // Pipeline counter to prevent resource exhaustion
+    // Limits concurrent pipelines per stream to prevent VAAPI context exhaustion
+    let pipeline_count = Arc::new(AtomicUsize::new(0));
+    const MAX_PIPELINES_PER_STREAM: usize = 2;
+
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
@@ -170,10 +176,47 @@ pub(super) async fn make_factory(
                     log::info!("New RTSP client connection for {name}::{stream} - creating pipeline");
                     let camera = camera.clone();
                     let name = name.clone();
+                    let pipeline_count_clone = pipeline_count.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
                         log::debug!("{name}::{stream}: Pipeline lifecycle: CREATED");
+
+                        // Check pipeline limit before creating new pipeline
+                        let current_count = pipeline_count_clone.load(Ordering::Relaxed);
+                        if current_count >= MAX_PIPELINES_PER_STREAM {
+                            log::error!(
+                                "{name}::{stream}: Pipeline limit reached ({}/{}). Rejecting new connection to prevent VAAPI resource exhaustion.",
+                                current_count, MAX_PIPELINES_PER_STREAM
+                            );
+                            log::error!(
+                                "{name}::{stream}: This prevents GPU/encoder context exhaustion. Wait for existing pipelines to terminate."
+                            );
+                            let _ = reply.send(element); // Return empty element
+                            return AnyResult::Ok(());
+                        }
+
+                        // Increment counter for new pipeline
+                        pipeline_count_clone.fetch_add(1, Ordering::Relaxed);
+                        let active_count = pipeline_count_clone.load(Ordering::Relaxed);
+                        log::info!(
+                            "{name}::{stream}: Pipeline ACTIVE ({}/{})",
+                            active_count, MAX_PIPELINES_PER_STREAM
+                        );
+
+                        // Warn when approaching VAAPI resource limits
+                        if active_count >= MAX_PIPELINES_PER_STREAM - 1 {
+                            log::warn!(
+                                "{name}::{stream}: Approaching pipeline limit ({}/{}). VAAPI/GPU resources nearly exhausted.",
+                                active_count, MAX_PIPELINES_PER_STREAM
+                            );
+                            log::warn!(
+                                "{name}::{stream}: If using hardware transcoding, new connections may fail due to encoder context exhaustion."
+                            );
+                            log::warn!(
+                                "{name}::{stream}: Check: 1) vainfo output, 2) /dev/dri/ permissions, 3) Consider reducing concurrent clients"
+                            );
+                        }
 
                         // Start the camera
                         let config = camera.config().await?.borrow().clone();
@@ -337,27 +380,44 @@ pub(super) async fn make_factory(
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             let streaming_result = (|| {
-                                while let Some(data) = media_rx.blocking_recv() {
-                                    match send_to_sources(
-                                        data,
-                                        &mut pools,
-                                        &vid_src,
-                                        &aud_src,
-                                        &mut vid_ts,
-                                        &mut aud_ts,
-                                        &stream_config,
-                                    ) {
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            log::info!(
-                                                "{name}::{stream}: Failed to send to source: {e:?}"
+                                loop {
+                                    // Use blocking_recv_timeout to prevent zombie pipelines
+                                    // If camera disconnects, channel may hang forever without timeout
+                                    match media_rx.blocking_recv_timeout(Duration::from_secs(30)) {
+                                        Ok(data) => {
+                                            match send_to_sources(
+                                                data,
+                                                &mut pools,
+                                                &vid_src,
+                                                &aud_src,
+                                                &mut vid_ts,
+                                                &mut aud_ts,
+                                                &stream_config,
+                                            ) {
+                                                Ok(_) => {}
+                                                Err(e) => {
+                                                    log::info!(
+                                                        "{name}::{stream}: Failed to send to source: {e:?}"
+                                                    );
+                                                    return Err(e);
+                                                }
+                                            }
+                                        }
+                                        Err(tokio::sync::mpsc::error::RecvTimeoutError::Timeout) => {
+                                            log::warn!(
+                                                "{name}::{stream}: No frames received for 30s - camera may have disconnected"
                                             );
-                                            return Err(e);
+                                            log::debug!(
+                                                "{name}::{stream}: Exiting streaming task to prevent zombie pipeline"
+                                            );
+                                            return AnyResult::Ok(());
+                                        }
+                                        Err(tokio::sync::mpsc::error::RecvTimeoutError::Closed) => {
+                                            log::trace!("{name}::{stream}: Media channel closed - streaming ended");
+                                            return AnyResult::Ok(());
                                         }
                                     }
                                 }
-                                log::trace!("{name}::{stream}: All media received, streaming ended");
-                                AnyResult::Ok(())
                             })();
 
                             // Always cleanup sources, regardless of success or failure
@@ -404,6 +464,13 @@ pub(super) async fn make_factory(
                         } else {
                             log::error!("{name_clone}::{stream_clone}: Pipeline lifecycle: CLEANUP_ERROR - could not cast to Bin");
                         }
+
+                        // Decrement pipeline counter on cleanup
+                        let remaining = pipeline_count_clone.fetch_sub(1, Ordering::Relaxed) - 1;
+                        log::info!(
+                            "{name_clone}::{stream_clone}: Pipeline TERMINATED. Remaining active: {}/{}",
+                            remaining, MAX_PIPELINES_PER_STREAM
+                        );
 
                         stream_result
                     });

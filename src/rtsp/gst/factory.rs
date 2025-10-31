@@ -139,8 +139,21 @@ impl NeoMediaFactoryImpl {
 impl ObjectImpl for NeoMediaFactoryImpl {}
 impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
-        self.parent_create_element(url)
-            .and_then(|orig| self.build_pipeline(orig).expect("Could not build pipeline"))
+        self.parent_create_element(url).and_then(|orig| {
+            match self.build_pipeline(orig) {
+                Ok(element) => element,
+                Err(e) => {
+                    log::error!(
+                        "Failed to build pipeline for URL {}: {:?}. This may indicate resource exhaustion (VAAPI contexts, GPU memory, file descriptors).",
+                        url, e
+                    );
+                    log::error!(
+                        "If using hardware transcoding, check: 1) vainfo output, 2) /dev/dri/ permissions, 3) concurrent pipeline count"
+                    );
+                    None
+                }
+            }
+        })
     }
 }
 
