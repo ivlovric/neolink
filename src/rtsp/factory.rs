@@ -154,6 +154,59 @@ enum ClientMsg {
     },
 }
 
+/// Guard that automatically decrements the pipeline counter when dropped
+/// This ensures the counter is always decremented, even if the task panics or times out
+/// Also tracks pipeline lifetime for zombie detection
+struct PipelineCounterGuard {
+    counter: Arc<AtomicUsize>,
+    name: String,
+    stream: String,
+    max_pipelines: usize,
+    created_at: std::time::Instant,
+}
+
+impl PipelineCounterGuard {
+    fn new(counter: Arc<AtomicUsize>, name: String, stream: String, max_pipelines: usize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counter,
+            name,
+            stream,
+            max_pipelines,
+            created_at: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for PipelineCounterGuard {
+    fn drop(&mut self) {
+        let remaining = self.counter.fetch_sub(1, Ordering::Relaxed) - 1;
+        let lifetime = self.created_at.elapsed();
+
+        // Log normal termination
+        log::info!(
+            "{}::{}: Pipeline TERMINATED after {:?}. Remaining active: {}/{}",
+            self.name, self.stream, lifetime, remaining, self.max_pipelines
+        );
+
+        // Warn about potential zombie pipelines (active > 5 minutes without normal data flow)
+        if lifetime > Duration::from_secs(300) {
+            log::warn!(
+                "{}::{}: Pipeline had unusually long lifetime: {:?}",
+                self.name, self.stream, lifetime
+            );
+            log::warn!(
+                "{}::{}: This may indicate a zombie pipeline that was stuck without proper cleanup",
+                self.name, self.stream
+            );
+            log::warn!(
+                "{}::{}: Check for GStreamer errors, VAAPI resource exhaustion, or camera disconnect issues",
+                self.name, self.stream
+            );
+        }
+    }
+}
+
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
@@ -196,8 +249,13 @@ pub(super) async fn make_factory(
                             return AnyResult::Ok(());
                         }
 
-                        // Increment counter for new pipeline
-                        pipeline_count_clone.fetch_add(1, Ordering::Relaxed);
+                        // Create pipeline counter guard - will auto-decrement on drop (even on panic/timeout)
+                        let _pipeline_guard = PipelineCounterGuard::new(
+                            pipeline_count_clone.clone(),
+                            name.clone(),
+                            stream.to_string(),
+                            MAX_PIPELINES_PER_STREAM,
+                        );
                         let active_count = pipeline_count_clone.load(Ordering::Relaxed);
                         log::info!(
                             "{name}::{stream}: Pipeline ACTIVE ({}/{})",
@@ -452,19 +510,27 @@ pub(super) async fn make_factory(
                             streaming_result
                         });
 
-                        // Wait for the streaming task to complete and propagate errors
-                        let stream_result = match stream_handle.await {
-                            Ok(Ok(())) => {
+                        // Wait for the streaming task to complete with timeout to prevent indefinite blocking
+                        // The 35 second timeout is slightly longer than the 30s frame timeout to allow
+                        // the streaming task to detect camera disconnect and exit gracefully
+                        let stream_result = match tokio::time::timeout(Duration::from_secs(35), stream_handle).await {
+                            Ok(Ok(Ok(()))) => {
                                 log::debug!("{name_clone}::{stream_clone}: Streaming completed successfully");
                                 AnyResult::Ok(())
                             }
-                            Ok(Err(e)) => {
+                            Ok(Ok(Err(e))) => {
                                 log::error!("{name_clone}::{stream_clone}: Streaming error: {e:?}");
                                 Err(e)
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 log::error!("{name_clone}::{stream_clone}: Streaming task panicked: {e:?}");
                                 Err(anyhow!("Streaming task panicked: {e:?}"))
+                            }
+                            Err(_) => {
+                                log::error!("{name_clone}::{stream_clone}: Streaming task timed out after 35s");
+                                log::error!("{name_clone}::{stream_clone}: The spawn_blocking thread may be stuck in GStreamer C code");
+                                log::error!("{name_clone}::{stream_clone}: This thread will be leaked but pipeline cleanup will proceed");
+                                Err(anyhow!("Streaming timeout - task may be blocked in GStreamer"))
                             }
                         };
 
@@ -472,31 +538,45 @@ pub(super) async fn make_factory(
                         // This is critical to prevent resource leaks when streams end
                         log::debug!("{name_clone}::{stream_clone}: Pipeline lifecycle: ENDING - cleaning up resources");
                         if let Ok(bin) = element_for_cleanup.dynamic_cast::<Bin>() {
-                            // Set bin to NULL state to release all elements and VAAPI resources
-                            match bin.set_state(gstreamer::State::Null) {
-                                Ok(_) => {
-                                    // Wait for state change to complete
+                            // Wrap bin.set_state in a separate thread with timeout to prevent indefinite blocking
+                            // GStreamer's set_state can block forever if elements are stuck in state transitions
+                            let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
+                            let bin_clone_for_cleanup = bin.clone();
+                            let name_for_cleanup = name_clone.clone();
+                            let stream_for_cleanup = stream_clone;
+
+                            std::thread::spawn(move || {
+                                let result = bin_clone_for_cleanup.set_state(gstreamer::State::Null);
+                                let _ = cleanup_tx.send(result);
+                            });
+
+                            match cleanup_rx.recv_timeout(Duration::from_secs(5)) {
+                                Ok(Ok(_)) => {
+                                    // State change initiated, now wait for it to complete
                                     let (result, current, _) = bin.state(gstreamer::ClockTime::from_mseconds(1000));
                                     if result.is_ok() && current == gstreamer::State::Null {
-                                        log::info!("{name_clone}::{stream_clone}: Pipeline lifecycle: DESTROYED - all resources released");
+                                        log::info!("{name_for_cleanup}::{stream_for_cleanup}: Pipeline lifecycle: DESTROYED - all resources released");
                                     } else {
-                                        log::warn!("{name_clone}::{stream_clone}: Pipeline lifecycle: CLEANUP_INCOMPLETE - state={:?}", current);
+                                        log::warn!("{name_for_cleanup}::{stream_for_cleanup}: Pipeline lifecycle: CLEANUP_INCOMPLETE - state={:?}", current);
                                     }
                                 }
-                                Err(e) => {
-                                    log::error!("{name_clone}::{stream_clone}: Pipeline lifecycle: CLEANUP_FAILED - {:?}", e);
+                                Ok(Err(e)) => {
+                                    log::error!("{name_for_cleanup}::{stream_for_cleanup}: Pipeline lifecycle: CLEANUP_FAILED - {:?}", e);
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    log::error!("{name_for_cleanup}::{stream_for_cleanup}: Pipeline cleanup timed out after 5s - thread stuck in GStreamer");
+                                    log::error!("{name_for_cleanup}::{stream_for_cleanup}: Pipeline resources may be leaked. Bin and thread will be abandoned.");
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    log::error!("{name_for_cleanup}::{stream_for_cleanup}: Pipeline cleanup thread disconnected unexpectedly");
                                 }
                             }
                         } else {
                             log::error!("{name_clone}::{stream_clone}: Pipeline lifecycle: CLEANUP_ERROR - could not cast to Bin");
                         }
 
-                        // Decrement pipeline counter on cleanup
-                        let remaining = pipeline_count_clone.fetch_sub(1, Ordering::Relaxed) - 1;
-                        log::info!(
-                            "{name_clone}::{stream_clone}: Pipeline TERMINATED. Remaining active: {}/{}",
-                            remaining, MAX_PIPELINES_PER_STREAM
-                        );
+                        // Pipeline counter will be automatically decremented by _pipeline_guard Drop
+                        // This happens even if cleanup times out or task panics, ensuring counter accuracy
 
                         stream_result
                     });

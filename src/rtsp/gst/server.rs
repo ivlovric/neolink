@@ -97,6 +97,8 @@ impl NeoRtspServer {
             .with_context(|| "Timeout waiting to lock Server threads")?
             .spawn(async move { handle.await? });
 
+        // Session cleanup thread with heartbeat channel for watchdog
+        let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::channel::<()>();
         let clean_up_server = server.clone();
         let handle = tokio::task::spawn_blocking(move || {
             while !main_loop_cancel.is_cancelled() {
@@ -116,7 +118,61 @@ impl NeoRtspServer {
                         RTSPFilterResult::Keep
                     }));
                 }
+
+                // Send heartbeat to watchdog thread
+                let _ = heartbeat_tx.send(());
+
                 std::thread::sleep(Duration::from_secs(5));
+            }
+            AnyResult::Ok(())
+        });
+        timeout(Duration::from_secs(5), self.imp().threads.write())
+            .await
+            .with_context(|| "Timeout waiting to lock Server threads")?
+            .spawn(async move { handle.await? });
+
+        // GStreamer MainLoop watchdog thread
+        // Monitors MainLoop health and aborts the process if it's stuck for too long
+        info!("Starting GStreamer MainLoop watchdog thread");
+        let handle = tokio::task::spawn_blocking(move || {
+            let timeout_duration = Duration::from_secs(60);
+            loop {
+                match heartbeat_rx.recv_timeout(timeout_duration) {
+                    Ok(()) => {
+                        // Received heartbeat, MainLoop is healthy
+                        debug!("GStreamer MainLoop watchdog: heartbeat received, system healthy");
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // No heartbeat received in 60 seconds - MainLoop is likely stuck
+                        error!("╔════════════════════════════════════════════════════════════╗");
+                        error!("║  CRITICAL: GStreamer MainLoop watchdog timeout detected!  ║");
+                        error!("╚════════════════════════════════════════════════════════════╝");
+                        error!("");
+                        error!("The GStreamer MainLoop has not responded for 60 seconds.");
+                        error!("This indicates the MainLoop thread is stuck in blocking C code.");
+                        error!("");
+                        error!("Common causes:");
+                        error!("  - GStreamer element stuck in state transition");
+                        error!("  - VAAPI resource deadlock");
+                        error!("  - DRM device operation hung");
+                        error!("  - Buffer pool exhaustion");
+                        error!("");
+                        error!("The process cannot recover from this condition.");
+                        error!("Aborting to allow container/systemd to restart...");
+                        error!("");
+
+                        // Give logs a moment to flush
+                        std::thread::sleep(Duration::from_millis(500));
+
+                        // Force process termination - this is the only way to kill stuck GStreamer threads
+                        std::process::abort();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // Cleanup thread exited (normal shutdown)
+                        info!("GStreamer MainLoop watchdog: cleanup thread exited, watchdog stopping");
+                        break;
+                    }
+                }
             }
             AnyResult::Ok(())
         });
