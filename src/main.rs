@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
 
     let opt = Opt::parse();
 
-    let conf_path = opt.config.context("Must supply --config file")?;
+    let conf_path = opt.config.clone().context("Must supply --config file")?;
     let config: Config = toml::from_str(
         &fs::read_to_string(&conf_path)
             .with_context(|| format!("Failed to read {:?}", conf_path))?,
@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
                 "Deprecated command line option. Please use: `neolink rtsp --config={:?}`",
                 conf_path
             );
-            rtsp::main(rtsp::Opt {}, neo_reactor.clone()).await?;
+            rtsp::main(rtsp::Opt {}, neo_reactor.clone()).await
         }
         #[cfg(not(feature = "gstreamer"))]
         None => {
@@ -134,50 +134,50 @@ async fn main() -> Result<()> {
                 "Deprecated command line option. Please use: `neolink mqtt --config={:?}`",
                 conf_path
             );
-            mqtt::main(mqtt::Opt {}, neo_reactor.clone()).await?;
+            mqtt::main(mqtt::Opt {}, neo_reactor.clone()).await
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::Rtsp(opts)) => {
-            rtsp::main(opts, neo_reactor.clone()).await?;
+            rtsp::main(opts, neo_reactor.clone()).await
         }
         Some(Command::StatusLight(opts)) => {
-            statusled::main(opts, neo_reactor.clone()).await?;
+            statusled::main(opts, neo_reactor.clone()).await
         }
         Some(Command::Reboot(opts)) => {
-            reboot::main(opts, neo_reactor.clone()).await?;
+            reboot::main(opts, neo_reactor.clone()).await
         }
         Some(Command::Pir(opts)) => {
-            pir::main(opts, neo_reactor.clone()).await?;
+            pir::main(opts, neo_reactor.clone()).await
         }
         Some(Command::Ptz(opts)) => {
-            ptz::main(opts, neo_reactor.clone()).await?;
+            ptz::main(opts, neo_reactor.clone()).await
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::Talk(opts)) => {
-            talk::main(opts, neo_reactor.clone()).await?;
+            talk::main(opts, neo_reactor.clone()).await
         }
         Some(Command::Mqtt(opts)) => {
-            mqtt::main(opts, neo_reactor.clone()).await?;
+            mqtt::main(opts, neo_reactor.clone()).await
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::MqttRtsp(opts)) => {
             tokio::select! {
                 v = mqtt::main(opts, neo_reactor.clone()) => v,
                 v = rtsp::main(rtsp::Opt {}, neo_reactor.clone()) => v,
-            }?;
+            }
         }
         #[cfg(feature = "gstreamer")]
         Some(Command::Image(opts)) => {
-            image::main(opts, neo_reactor.clone()).await?;
+            image::main(opts, neo_reactor.clone()).await
         }
         Some(Command::Battery(opts)) => {
-            battery::main(opts, neo_reactor.clone()).await?;
+            battery::main(opts, neo_reactor.clone()).await
         }
         Some(Command::Services(opts)) => {
-            services::main(opts, neo_reactor.clone()).await?;
+            services::main(opts, neo_reactor.clone()).await
         }
         Some(Command::Users(opts)) => {
-            users::main(opts, neo_reactor.clone()).await?;
+            users::main(opts, neo_reactor.clone()).await
         }
         }
     };
