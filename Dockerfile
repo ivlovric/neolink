@@ -6,7 +6,6 @@
 
 FROM docker.io/rust:slim-bookworm AS build
 ARG TARGETPLATFORM
-ARG USE_GSTREAMER=false
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /usr/local/src/neolink
@@ -25,13 +24,12 @@ COPY . /usr/local/src/neolink
 #
 # hadolint ignore=DL3008
 RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
-  echo "USE_GSTREAMER: ${USE_GSTREAMER}"; \
   if [ -f "${TARGETPLATFORM}/neolink" ]; then \
     echo "Restoring from artifact"; \
     mkdir -p /usr/local/src/neolink/target/release/; \
     cp "${TARGETPLATFORM}/neolink" "/usr/local/src/neolink/target/release/neolink"; \
   else \
-    echo "Building from scratch"; \
+    echo "Building from scratch with FFmpeg support"; \
     apt-get update && \
         apt-get upgrade -y && \
         apt-get install -y --no-install-recommends \
@@ -41,38 +39,24 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
           libssl-dev \
           ca-certificates \
           protobuf-compiler && \
-        if [ "${USE_GSTREAMER}" = "true" ]; then \
-          echo "Installing GStreamer build dependencies"; \
-          apt-get install -y --no-install-recommends \
-            libgstrtspserver-1.0-dev \
-            libgstreamer1.0-dev \
-            libgtk2.0-dev \
-            libglib2.0-dev; \
-        fi && \
-        apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
-    if [ "${USE_GSTREAMER}" = "true" ]; then \
-      echo "Building with GStreamer support"; \
-      cargo build --release --features=gstreamer; \
-    else \
-      echo "Building with FFmpeg support (default)"; \
-      cargo build --release --no-default-features; \
-    fi; \
+        apt-get clean -y && rm -rf /var/lib/apt/lists/* && \
+        cargo build --release --no-default-features; \
   fi
 
 # Create the release container. Match the base OS used to build
-FROM debian:bookworm-slim AS runtime-ffmpeg
+FROM debian:bookworm-slim AS runtime
 ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION
 ARG OWNER
 ARG MEDIAMTX_VERSION=v1.9.3
 
-LABEL description="An image for the neolink program which is a reolink camera to rtsp translator (FFmpeg + MediaMTX)"
+LABEL description="An image for the neolink program which is a reolink camera to rtsp translator"
 LABEL repository="$REPO"
 LABEL version="$VERSION"
 LABEL maintainer="$OWNER"
 
-# Install runtime dependencies for FFmpeg mode
+# Install runtime dependencies
 # ffmpeg: Media transcoding and format conversion
 # ca-certificates: SSL/TLS certificates for HTTPS
 # openssl: SSL/TLS library
@@ -113,6 +97,7 @@ COPY --from=build \
 COPY docker/entrypoint-ffmpeg.sh /entrypoint.sh
 
 RUN chmod +x "/usr/local/bin/neolink" && \
+    chmod +x /entrypoint.sh && \
     "/usr/local/bin/neolink" --version && \
     mkdir -m 0700 /root/.config/
 
@@ -125,71 +110,3 @@ ENTRYPOINT ["/entrypoint.sh"]
 
 # Expose RTSP port (MediaMTX) and API port
 EXPOSE ${NEO_LINK_PORT} ${MEDIAMTX_API_PORT}
-
-# Legacy GStreamer runtime stage (optional)
-FROM debian:bookworm-slim AS runtime-gstreamer
-ARG TARGETPLATFORM
-ARG REPO
-ARG VERSION
-ARG OWNER
-
-LABEL description="An image for the neolink program which is a reolink camera to rtsp translator (Legacy GStreamer)"
-LABEL repository="$REPO"
-LABEL version="$VERSION"
-LABEL maintainer="$OWNER"
-
-# Install runtime dependencies for GStreamer mode (legacy)
-# gstreamer1.0-plugins-ugly: Provides x264enc for H.265->H.264 transcoding
-# gstreamer1.0-libav: Provides avdec_h265 decoder for transcoding
-# gstreamer1.0-vaapi: Hardware acceleration via VA-API (Intel/AMD)
-# i965-va-driver: Intel GPU driver (Broadwell through Coffee Lake, Gen 8-9)
-# intel-media-va-driver: Intel GPU driver (Broadwell+ optimized, Gen 8+)
-# mesa-va-drivers: AMD GPU driver and modern Intel fallback
-# hadolint ignore=DL3008,DL3009
-RUN apt-get update && \
-    apt-get upgrade -y && \
-    # Install base utilities and certificates first
-    apt-get install -y --no-install-recommends \
-        openssl \
-        dnsutils \
-        iputils-ping \
-        ca-certificates && \
-    # Install GStreamer core and basic plugins
-    apt-get install -y --no-install-recommends \
-        libgstrtspserver-1.0-0 \
-        libgstreamer1.0-0 \
-        gstreamer1.0-tools \
-        gstreamer1.0-x \
-        gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good && \
-    # Install additional GStreamer plugins
-    apt-get install -y --no-install-recommends \
-        gstreamer1.0-plugins-bad \
-        gstreamer1.0-plugins-ugly \
-        gstreamer1.0-libav && \
-    # Install hardware acceleration drivers (optional)
-    apt-get install -y --no-install-recommends \
-        gstreamer1.0-vaapi \
-        i965-va-driver \
-        intel-media-va-driver \
-        mesa-va-drivers && \
-    apt-get clean -y && rm -rf /var/lib/apt/lists/*
-
-COPY --from=build \
-  /usr/local/src/neolink/target/release/neolink \
-  /usr/local/bin/neolink
-COPY docker/entrypoint.sh /entrypoint.sh
-
-RUN gst-inspect-1.0; \
-    chmod +x "/usr/local/bin/neolink" && \
-    "/usr/local/bin/neolink" --version && \
-    mkdir -m 0700 /root/.config/
-
-ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
-
-CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
-ENTRYPOINT ["/entrypoint.sh"]
-EXPOSE ${NEO_LINK_PORT}
-
-# Default to FFmpeg runtime
-FROM runtime-ffmpeg
