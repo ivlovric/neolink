@@ -592,6 +592,7 @@ fn send_to_sources(
                     aac.data,
                     Duration::from_micros(*aud_ts as u64),
                     pools,
+                    true, // Audio frames are always treated as "keyframes"
                 )?;
             }
             *aud_ts += duration;
@@ -607,15 +608,23 @@ fn send_to_sources(
                     adpcm.data,
                     Duration::from_micros(*aud_ts as u64),
                     pools,
+                    true, // Audio frames are always treated as "keyframes"
                 )?;
             }
             *aud_ts += duration;
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+        BcMedia::Iframe(BcMediaIframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools)?;
+                log::trace!("Sending I-frame: {:?}", Duration::from_micros(*vid_ts as u64));
+                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools, true)?;
+            }
+            const MICROSECONDS: u32 = 1000000;
+            *vid_ts += MICROSECONDS / stream_config.fps;
+        }
+        BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+            if let Some(vid_src) = vid_src.as_ref() {
+                log::trace!("Sending P-frame: {:?}", Duration::from_micros(*vid_ts as u64));
+                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64), pools, false)?;
             }
             const MICROSECONDS: u32 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps;
@@ -630,6 +639,7 @@ fn send_to_appsrc(
     data: Vec<u8>,
     mut ts: Duration,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    is_keyframe: bool,
 ) -> AnyResult<()> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
@@ -690,43 +700,37 @@ fn send_to_appsrc(
         gst_buf
     };
 
+    // Check buffer levels before pushing to prevent blocking
+    let current_level = appsrc.current_level_bytes();
+    let max_bytes = appsrc.max_bytes();
+    let buffer_usage = if max_bytes > 0 {
+        (current_level * 100) / max_bytes
+    } else {
+        0
+    };
+
+    // If buffer is >90% full and this is not a keyframe, skip to prevent blocking
+    if buffer_usage > 90 && !is_keyframe {
+        log::debug!(
+            "Dropping non-keyframe on {} (buffer {}% full: {}/{})",
+            appsrc.name(),
+            buffer_usage,
+            current_level,
+            max_bytes
+        );
+        return Ok(());
+    }
+
     // Push buffer into the appsrc
     match appsrc.push_buffer(buf) {
-        Ok(_) => {
-            // log::info!(
-            //     "Send {}{} on {}",
-            //     data.data.len(),
-            //     if data.keyframe { " (keyframe)" } else { "" },
-            //     appsrc.name()
-            // );
-            Ok(())
-        }
+        Ok(_) => Ok(()),
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
-            );
+            // Pipeline is being flushed (e.g., during teardown)
+            log::debug!("Pipeline flushing on {}, skipping frame", appsrc.name());
             Ok(())
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
-    }?;
-    // Check if we need to pause/resume based on buffer levels
-    // Use hysteresis to avoid rapid state changes
-    let current_level = appsrc.current_level_bytes();
-    let max_bytes = appsrc.max_bytes();
-    let current_state = appsrc.current_state();
-
-    if current_level >= max_bytes * 2 / 3 && matches!(current_state, gstreamer::State::Paused) {
-        if let Err(e) = appsrc.set_state(gstreamer::State::Playing) {
-            log::warn!("Failed to set {} to Playing state: {:?}", appsrc.name(), e);
-        }
-    } else if current_level <= max_bytes / 3 && matches!(current_state, gstreamer::State::Playing) {
-        if let Err(e) = appsrc.set_state(gstreamer::State::Paused) {
-            log::warn!("Failed to set {} to Paused state: {:?}", appsrc.name(), e);
-        }
     }
-    Ok(())
 }
 fn check_live(app: &AppSrc) -> Result<()> {
     // Check if bus exists - this indicates the element is part of a valid pipeline
@@ -1834,8 +1838,9 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 }
 
 fn buffer_size(bitrate: u32) -> u32 {
-    // 0.1 seconds (according to bitrate) or 4kb what ever is larger
-    std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+    // 2 seconds (according to bitrate) or 4kb what ever is larger
+    // Increased from 0.25s to handle network latency and slow clients
+    std::cmp::max(bitrate * 2, 4u32 * 1024u32)
 }
 
 #[cfg(test)]
