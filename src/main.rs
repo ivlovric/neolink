@@ -29,6 +29,9 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+// Used by rtsp module for mediamtx client
+use reqwest as _;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use env_logger::Env;

@@ -1,14 +1,83 @@
 version: '3.8'
 services:
+  # Default: Neolink with FFmpeg + MediaMTX (recommended)
+  # This is the new architecture that's simpler and more stable
   neolink:
-    image: ivlovric/neolink # If a specific version should be targetted, target it here with `:vx.x.x`
-    command: ["/usr/local/bin/neolink", "rtsp", "--config=/etc/neolink.toml"]  # The NEO_LINK_MODE can be set by modifying this command
+    image: ivlovric/neolink:latest  # Use :vx.x.x for specific version
     container_name: neolink
-    privileged: true  # Required for hardware transcoding (GPU access)
-    devices:
-      - /dev/dri:/dev/dri  # GPU devices for hardware acceleration
+    restart: unless-stopped
+
+    # Ports for FFmpeg mode
     ports:
-      - 8554:8554
+      - 8554:8554     # RTSP (MediaMTX)
+      - 9997:9997     # MediaMTX HTTP API (optional, for monitoring)
+
     volumes:
       - $PWD/neolink.toml:/etc/neolink.toml
+
+    # Command for FFmpeg mode (default)
+    command: ["/usr/local/bin/neolink", "rtsp", "--config=/etc/neolink.toml"]
+
+    environment:
+      - RUST_LOG=neolink=info
+
+    # Note: privileged mode and GPU access NOT required for FFmpeg mode
+    # FFmpeg does software encoding which is simpler and more reliable
+
+  # Legacy: Neolink with GStreamer (backwards compatibility)
+  # Use this if you need the old GStreamer-based implementation
+  neolink-legacy:
+    image: ivlovric/neolink:gstreamer  # Legacy GStreamer image
+    container_name: neolink-legacy
     restart: unless-stopped
+
+    # Ports for GStreamer mode
+    ports:
+      - 8555:8554     # RTSP (GStreamer) - different port to avoid conflict
+
+    volumes:
+      - $PWD/neolink.toml:/etc/neolink.toml
+
+    command: ["/usr/local/bin/neolink", "rtsp", "--config=/etc/neolink.toml"]
+
+    environment:
+      - RUST_LOG=neolink=info
+
+    # Hardware acceleration for GStreamer (optional)
+    privileged: true
+    devices:
+      - /dev/dri:/dev/dri  # GPU devices for VAAPI hardware acceleration
+
+    profiles:
+      - legacy  # Only start if 'legacy' profile is specified
+
+# Usage Examples:
+#
+# Start FFmpeg mode (recommended, default):
+#   docker-compose up -d neolink
+#
+# Start GStreamer mode (legacy):
+#   docker-compose --profile legacy up -d neolink-legacy
+#
+# View logs:
+#   docker-compose logs -f neolink
+#
+# Access streams:
+#   FFmpeg mode:     rtsp://localhost:8554/CameraName
+#   GStreamer mode:  rtsp://localhost:8555/CameraName
+#
+# Monitor MediaMTX (FFmpeg mode only):
+#   curl http://localhost:9997/v3/paths/list
+#
+# Stop:
+#   docker-compose down
+
+# Building from source:
+#
+# Build FFmpeg image:
+#   docker build -t neolink:ffmpeg .
+#
+# Build GStreamer image:
+#   docker build --target runtime-gstreamer --build-arg USE_GSTREAMER=true -t neolink:gstreamer .
+#
+# Then update the 'image:' field above to use your local image

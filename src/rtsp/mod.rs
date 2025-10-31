@@ -68,17 +68,24 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 mod cmdline;
-mod factory;
-mod gst;
+mod ffmpeg;
+mod mediamtx;
 mod stream;
 
+// Keep old modules for now during migration
+#[cfg(feature = "gstreamer")]
+mod factory;
+#[cfg(feature = "gstreamer")]
+mod gst;
+
 use crate::common::{NeoInstance, NeoReactor};
-use factory::*;
 use stream::*;
 
 use super::config::UserConfig;
 pub(crate) use cmdline::Opt;
-use gst::NeoRtspServer;
+
+// Use MediaMTX client instead of GStreamer RTSP server
+use mediamtx::MediaMtxClient;
 
 type AnyResult<T> = anyhow::Result<T, anyhow::Error>;
 
@@ -86,66 +93,45 @@ type AnyResult<T> = anyhow::Result<T, anyhow::Error>;
 ///
 /// Opt is the command line options
 pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
-    let rtsp = Arc::new(NeoRtspServer::new()?);
-
     let global_cancel = CancellationToken::new();
-
     let mut set = JoinSet::new();
 
-    // Thread for the TLS from the config
-    let mut thread_config = reactor.config().await?;
-    let thread_cancel = global_cancel.clone();
-    let thread_rtsp = rtsp.clone();
-    thread_rtsp.set_up_tls(&thread_config.borrow_and_update().clone())?;
-    set.spawn(async move {
-        tokio::select! {
-            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-            v = async {
-                loop {
-                    thread_config.changed().await?;
-                    if let Err(e) = thread_rtsp.set_up_tls(&thread_config.borrow().clone()) {
-                        log::error!("Could not setup TLS: {e}");
-                    }
-                }
-            } => v
+    // Get configuration for MediaMTX and FFmpeg
+    let config = reactor.config().await?.borrow().clone();
+    let mediamtx_api_url = config.mediamtx_api_url.clone();
+    let mediamtx_rtsp_url = config.mediamtx_rtsp_url.clone();
+    let ffmpeg_path = config.ffmpeg_path.clone();
+
+    info!("Initializing RTSP streaming with MediaMTX");
+    info!("MediaMTX API: {}", mediamtx_api_url);
+    info!("MediaMTX RTSP: {}", mediamtx_rtsp_url);
+    info!("FFmpeg path: {}", ffmpeg_path);
+
+    // Create MediaMTX client
+    let mediamtx = Arc::new(MediaMtxClient::new(
+        mediamtx_api_url,
+        mediamtx_rtsp_url,
+    ));
+
+    // Health check MediaMTX
+    info!("Performing MediaMTX health check...");
+    match mediamtx.health_check().await {
+        Ok(_) => info!("MediaMTX is accessible and running"),
+        Err(e) => {
+            error!("MediaMTX health check failed: {}", e);
+            error!("Please ensure MediaMTX is running and accessible");
+            error!("You can start MediaMTX with: mediamtx");
+            error!("Or install it from: https://github.com/bluenviron/mediamtx");
+            return Err(e);
         }
-    });
-
-    // Thread for the Users from the config
-    let mut thread_config = reactor.config().await?;
-    let thread_cancel = global_cancel.clone();
-    let thread_rtsp = rtsp.clone();
-    set.spawn(async move {
-        tokio::select! {
-            _ = thread_cancel.cancelled() => AnyResult::Ok(()),
-            v = async {
-                let mut curr_users = HashSet::new();
-                loop {
-
-                    curr_users = thread_config.wait_for(|new_config|
-                        new_config.users.iter().cloned().collect::<HashSet<_>>() != curr_users
-                    ).await?.users.iter().cloned().collect::<HashSet<_>>();
-
-                    let config = thread_config.borrow().clone();
-                    if let Err(e) = apply_users(&thread_rtsp, &curr_users).await {
-                        log::error!("Could not setup TLS: {e}");
-                    }
-
-                    if config.certificate.is_none() && !curr_users.is_empty() {
-                        warn!(
-                            "Without a server certificate, usernames and passwords will be exchanged in plaintext!"
-                        )
-                    }
-                }
-            } => v
-        }
-    });
+    }
 
     // Startup and stop cameras as they are added/removed to the config
     let mut thread_config = reactor.config().await?;
     let thread_cancel = global_cancel.clone();
-    let thread_rtsp = rtsp.clone();
+    let thread_mediamtx = mediamtx.clone();
     let thread_reactor = reactor.clone();
+    let thread_ffmpeg_path = ffmpeg_path.clone();
     set.spawn(async move {
         let mut set = JoinSet::<AnyResult<()>>::new();
         let thread_cancel2 = thread_cancel.clone();
@@ -162,12 +148,13 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
 
                     for name in config_names.iter() {
                         if ! cameras.contains_key(name) {
-                            log::info!("{name}: Rtsp Starting");
+                            log::info!("{name}: RTSP Starting");
                             let local_cancel = CancellationToken::new();
                             cameras.insert(name.clone(),local_cancel.clone() );
                             let thread_global_cancel = thread_cancel2.clone();
-                            let thread_rtsp2 = thread_rtsp.clone();
+                            let thread_mediamtx2 = thread_mediamtx.clone();
                             let thread_reactor2 = thread_reactor.clone();
+                            let thread_ffmpeg_path2 = thread_ffmpeg_path.clone();
                             let name = name.clone();
                             set.spawn(async move {
                                 let camera = thread_reactor2.get(&name).await?;
@@ -178,7 +165,7 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
                                     _ = local_cancel.cancelled() => {
                                         AnyResult::Ok(())
                                     },
-                                    v = camera_main(camera, &thread_rtsp2) => v,
+                                    v = camera_main(camera, &thread_mediamtx2, &thread_ffmpeg_path2) => v,
                                 )
                             }) ;
                         }
@@ -194,18 +181,11 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
         }
     });
 
-    let rtsp_config = reactor.config().await?.borrow().clone();
-    info!(
-        "Starting RTSP Server at {}:{}",
-        &rtsp_config.bind_addr, rtsp_config.bind_port,
-    );
+    info!("RTSP streaming service started successfully");
+    info!("Streams will be published to MediaMTX and available via RTSP");
+    info!("Access cameras at: {}/CameraName", mediamtx.get_publish_url("").trim_end_matches('/'));
 
-    let bind_addr = rtsp_config.bind_addr.clone();
-    let bind_port = rtsp_config.bind_port;
-    rtsp.run(&bind_addr, bind_port).await?;
-    let thread_rtsp = rtsp.clone();
-    set.spawn(async move { thread_rtsp.join().await });
-
+    // Wait for all tasks to complete or error
     while let Some(joined) = set
         .join_next()
         .await
@@ -217,52 +197,32 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
                 // Cancel all and await terminate
                 log::error!("Error: {e}");
                 global_cancel.cancel();
-                rtsp.quit().await?;
             }
             Ok(Ok(_)) => {
-                // All good
+                // Task completed successfully
             }
         }
     }
 
-    // Ensure GStreamer cleanup happens even on normal exit
-    info!("RTSP server shutting down, cleaning up GStreamer resources...");
-    rtsp.quit().await?;
-    rtsp.join().await?;
-    info!("RTSP server shutdown complete");
+    info!("RTSP streaming service shutting down...");
+    info!("All FFmpeg processes have been terminated");
+    info!("RTSP service shutdown complete");
 
-    Ok(())
-}
-
-/// This keeps the users in rtsp and the config in sync
-async fn apply_users(rtsp: &NeoRtspServer, curr_users: &HashSet<UserConfig>) -> AnyResult<()> {
-    // Add those missing
-    for user in curr_users.iter() {
-        log::debug!("Adding user {} to rtsp server", user.name);
-        rtsp.add_user(&user.name, &user.pass.clone().unwrap_or_default())
-            .await?;
-    }
-    // Remove unused
-    let rtsp_users = rtsp.get_users().await?;
-    for user in rtsp_users {
-        if !curr_users.iter().any(|a| a.name == user) {
-            log::debug!("Removing user {} from rtsp server", user);
-            rtsp.remove_user(&user).await?;
-        }
-    }
     Ok(())
 }
 
 /// Top level camera entry point
 ///
 /// It checks which streams are supported and then starts them
-async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
+async fn camera_main(camera: NeoInstance, mediamtx: &MediaMtxClient, ffmpeg_path: &str) -> Result<()> {
     let name = camera.config().await?.borrow().name.clone();
     log::debug!("{name}: Camera Main");
     let later_camera = camera.clone();
     let (supported_streams_tx, supported_streams) = watch(HashSet::<StreamKind>::new());
 
     let mut set = JoinSet::new();
+
+    // Spawn a task to periodically check supported streams
     set.spawn(async move {
         let mut i = IntervalStream::new(interval(Duration::from_secs(15)));
         while i.next().await.is_some() {
@@ -299,17 +259,14 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
     let mut camera_config = camera.config().await?.clone();
     loop {
         let prev_stream_config = camera_config.borrow_and_update().stream;
-        let prev_stream_users = camera_config.borrow().permitted_users.clone();
         let active_streams = prev_stream_config
             .as_stream_kinds()
             .drain(..)
             .collect::<HashSet<_>>();
-        let use_splash = camera_config.borrow().use_splash;
-        let splash_pattern = camera_config.borrow().splash_pattern.to_string();
 
         // This select is for changes to camera_config.stream
         break tokio::select! {
-            v = camera_config.wait_for(|config| config.stream != prev_stream_config || config.permitted_users != prev_stream_users || config.use_splash != use_splash) => {
+            v = camera_config.wait_for(|config| config.stream != prev_stream_config) => {
                 if let Err(e) = v {
                     AnyResult::Err(e.into())
                 } else {
@@ -319,27 +276,10 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
             },
             v = async {
                 // This select handles enabling the right stream
-                // and setting up the users
-                let all_users = rtsp.get_users().await?.iter().filter(|a| *a != "anyone" && *a != "anonymous").cloned().collect::<HashSet<_>>();
-                let permitted_users: HashSet<String> = match &prev_stream_users {
-                    // If in the camera config there is the user "anyone", or if none is specified but users
-                    // are defined at all, then we add all users to the camera's allowed list.
-                    Some(p) if p.iter().any(|u| u == "anyone") => all_users,
-                    None if !all_users.is_empty() => all_users,
-
-                    // The user specified permitted_users
-                    Some(p) => p.iter().cloned().collect(),
-
-                    // The user didn't specify permitted_users, and there are none defined anyway
-                    None => ["anonymous".to_string()].iter().cloned().collect(),
-                };
-
-                // Create the dummy factory
-                let dummy_factory = make_dummy_factory(use_splash, splash_pattern).await?;
-                dummy_factory.add_permitted_roles(&permitted_users);
                 let mut supported_streams_1 = supported_streams.clone();
                 let mut supported_streams_2 = supported_streams.clone();
                 let mut supported_streams_3 = supported_streams.clone();
+
                 tokio::select! {
                     v = async {
                         let name = camera.config().await?.borrow().name.clone();
@@ -351,26 +291,15 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                             format!("/{name}/Mainstream"),
                             format!("/{name}/mainstream"),
                         ];
-                        paths.push(
-                            format!("/{name}")
-                        );
-                        // Create a dummy factory so that the URL will not return 404 while waiting
-                        // for configuration to compete
-                        //
-                        // This is for BI since it will give up forever on a 404 rather then retry
-                        //
-                        let mounts = rtsp
-                            .mount_points()
-                            .ok_or(anyhow!("RTSP server lacks mount point"))?;
-                        for path in paths.iter() {
-                            log::debug!("Path: {}", path);
-                            mounts.add_factory(path, dummy_factory.clone());
-                        }
-                        log::debug!("{}: Preparing at {}", name, paths.join(", "));
+                        paths.push(format!("/{name}"));
 
+                        log::debug!("{}: Preparing main stream at {}", name, paths.join(", "));
+
+                        // Wait for stream to be supported
                         supported_streams_1.wait_for(|ss| ss.contains(&StreamKind::Main)).await?;
-                        stream_main(camera.clone(), StreamKind::Main, rtsp, &permitted_users, &paths).await
+                        stream_main(camera.clone(), StreamKind::Main, mediamtx, ffmpeg_path, &paths).await
                     }, if active_streams.contains(&StreamKind::Main) => v,
+
                     v = async {
                         let name = camera.config().await?.borrow().name.clone();
                         let mut paths = vec![
@@ -381,31 +310,17 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                             format!("/{name}/Substream"),
                             format!("/{name}/substream"),
                         ];
-                        if ! active_streams.contains(&StreamKind::Main) {
-                            paths.push(
-                                format!("/{name}")
-                            );
+                        if !active_streams.contains(&StreamKind::Main) {
+                            paths.push(format!("/{name}"));
                         }
 
-                        // Create a dummy factory so that the URL will not return 404 while waiting
-                        // for configuration to compete
-                        //
-                        // This is for BI since it will give up forever on a 404 rather then retry
-                        //
-                        let mounts = rtsp
-                            .mount_points()
-                            .ok_or(anyhow!("RTSP server lacks mount point"))?;
-                        // Create the dummy factory
-                        for path in paths.iter() {
-                            log::debug!("Path: {}", path);
-                            mounts.add_factory(path, dummy_factory.clone());
-                        }
-                        log::debug!("{}: Preparing at {}", name, paths.join(", "));
+                        log::debug!("{}: Preparing sub stream at {}", name, paths.join(", "));
 
+                        // Wait for stream to be supported
                         supported_streams_2.wait_for(|ss| ss.contains(&StreamKind::Sub)).await?;
-
-                        stream_main(camera.clone(), StreamKind::Sub, rtsp, &permitted_users, &paths).await
+                        stream_main(camera.clone(), StreamKind::Sub, mediamtx, ffmpeg_path, &paths).await
                     }, if active_streams.contains(&StreamKind::Sub) => v,
+
                     v = async {
                         let name = camera.config().await?.borrow().name.clone();
                         let mut paths = vec![
@@ -416,29 +331,17 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                             format!("/{name}/Externstream"),
                             format!("/{name}/externstream"),
                         ];
-                        if ! active_streams.contains(&StreamKind::Main) && ! active_streams.contains(&StreamKind::Sub) {
-                            paths.push(
-                                format!("/{name}")
-                            );
+                        if !active_streams.contains(&StreamKind::Main) && !active_streams.contains(&StreamKind::Sub) {
+                            paths.push(format!("/{name}"));
                         }
 
-                        // Create a dummy factory so that the URL will not return 404 while waiting
-                        // for configuration to compete
-                        //
-                        // This is for BI since it will give up forever on a 404 rather then retry
-                        //
-                        let mounts = rtsp
-                            .mount_points()
-                            .ok_or(anyhow!("RTSP server lacks mount point"))?;
-                        for path in paths.iter() {
-                            log::debug!("Path: {}", path);
-                            mounts.add_factory(path, dummy_factory.clone());
-                        }
-                        log::debug!("{}: Preparing at {}", name, paths.join(", "));
+                        log::debug!("{}: Preparing extern stream at {}", name, paths.join(", "));
 
+                        // Wait for stream to be supported
                         supported_streams_3.wait_for(|ss| ss.contains(&StreamKind::Extern)).await?;
-                        stream_main(camera.clone(), StreamKind::Extern, rtsp, &permitted_users, &paths).await
+                        stream_main(camera.clone(), StreamKind::Extern, mediamtx, ffmpeg_path, &paths).await
                     }, if active_streams.contains(&StreamKind::Extern) => v,
+
                     else => {
                         // all disabled just wait here until config is changed
                         futures::future::pending().await

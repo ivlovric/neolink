@@ -170,7 +170,123 @@ Configuration is TOML-based (see `sample_config.toml`). Key sections:
 - Logging: `env_logger` with RUST_LOG environment variable
 - XML handling: `quick-xml` with serde for protocol messages
 - Encryption: AES-CFB mode for protocol encryption
-- Media: GStreamer for RTSP server and media pipeline
+- Media: FFmpeg for transcoding, MediaMTX for RTSP server (migrated from GStreamer 2025-10-31)
+
+## RTSP Architecture (FFmpeg + MediaMTX - Current)
+
+As of 2025-10-31, Neolink has migrated from GStreamer to FFmpeg + MediaMTX for RTSP streaming.
+
+### New Architecture
+
+**Data Flow:**
+```
+Camera → BcMedia frames → FFmpeg stdin → FFmpeg process → RTSP push to MediaMTX → Clients
+```
+
+**Key Components:**
+- **MediaMTX**: External RTSP server (handles client connections, authentication, serving)
+- **FFmpeg**: Subprocess for transcoding/remuxing camera streams
+- **Neolink**: Bridges camera protocol to FFmpeg, manages FFmpeg processes
+
+### Key Files
+
+- `src/rtsp/ffmpeg.rs` - FFmpeg process wrapper (~300 lines)
+  - Spawns FFmpeg with stdin pipe
+  - Manages process lifecycle (spawn, monitor, restart, kill)
+  - Handles H.264/H.265 passthrough and transcoding
+
+- `src/rtsp/mediamtx.rs` - MediaMTX HTTP API client (~200 lines)
+  - Health checking via MediaMTX API
+  - Stream path validation
+  - RTSP URL generation for publishing
+
+- `src/rtsp/stream.rs` - Stream coordination (~148 lines)
+  - Detects stream codec (H.264 vs H.265)
+  - Configures transcode mode
+  - Pipes BcMedia frames to FFmpeg
+
+- `src/rtsp/mod.rs` - RTSP service entry point (~210 lines, simplified from 453)
+  - MediaMTX health check on startup
+  - Camera lifecycle management
+  - FFmpeg process coordination
+
+### Configuration
+
+New config fields (all optional with defaults):
+```toml
+# MediaMTX HTTP API URL
+mediamtx_api_url = "http://localhost:9997"  # default
+
+# MediaMTX RTSP URL for publishing
+mediamtx_rtsp_url = "rtsp://localhost:8554"  # default
+
+# FFmpeg binary path
+ffmpeg_path = "ffmpeg"  # default: use PATH
+```
+
+### Benefits vs GStreamer
+
+1. **Simplicity**: -2850 lines of code (-81%)
+   - No complex pipeline management
+   - No buffer pools or state machines
+   - No VAAPI context management
+
+2. **Stability**: Process isolation
+   - Clean kill semantics (SIGTERM works)
+   - No thread leaks
+   - FFmpeg handles codec complexities
+
+3. **Observability**: External processes
+   - Monitor: `ps aux | grep ffmpeg`
+   - Debug: `strace -p <pid>`
+   - MediaMTX API: `curl http://localhost:9997/v3/paths/list`
+
+4. **Maintainability**: Simpler architecture
+   - FFmpeg CLI is stable and well-documented
+   - MediaMTX handles RTSP serving
+   - Easier to debug and modify
+
+### Prerequisites
+
+- **FFmpeg**: Install via package manager (`apt install ffmpeg`, `brew install ffmpeg`, etc.)
+- **MediaMTX**: Download from https://github.com/bluenviron/mediamtx/releases
+  - Start before Neolink: `./mediamtx &`
+  - Or use Docker: `docker run -p 8554:8554 -p 9997:9997 bluenviron/mediamtx`
+
+### Common FFmpeg Issues
+
+**Issue:** FFmpeg not found
+```
+Failed to spawn FFmpeg: No such file or directory
+```
+**Solution:** Install FFmpeg or set `ffmpeg_path` in config
+
+**Issue:** MediaMTX not running
+```
+MediaMTX health check failed: Connection refused
+```
+**Solution:** Start MediaMTX: `./mediamtx &`
+
+**Issue:** Stream not appearing
+**Solution:**
+1. Check Neolink logs: `journalctl -u neolink -f`
+2. Verify FFmpeg running: `ps aux | grep ffmpeg`
+3. Check MediaMTX paths: `curl http://localhost:9997/v3/paths/list`
+
+See `FFMPEG_MIGRATION_GUIDE.md` for complete migration documentation.
+
+### Legacy GStreamer Support
+
+The old GStreamer code is kept behind the `gstreamer` feature flag for backwards compatibility:
+- `src/rtsp/factory.rs` (2043 lines) - GStreamer pipeline factory
+- `src/rtsp/gst.rs` - GStreamer RTSP server wrapper
+
+To use legacy GStreamer:
+```bash
+cargo build --features=gstreamer
+```
+
+**Note:** GStreamer support will be removed in a future release once FFmpeg is proven stable.
 
 ## Common Patterns
 
@@ -180,9 +296,11 @@ Configuration is TOML-based (see `sample_config.toml`). Key sections:
 - Config validation uses the `validator` crate
 - Channel-based communication between threads (crossbeam-channel, tokio channels)
 
-## RTSP Stability (Recent Improvements - 2025-10-29)
+## RTSP Stability - GStreamer (Historical / Legacy)
 
-The RTSP implementation has undergone significant stability improvements to address resource leaks, deadlocks, and panics:
+**Note:** This section documents the old GStreamer implementation (pre-2025-10-31). For the current FFmpeg-based implementation, see "RTSP Architecture (FFmpeg + MediaMTX - Current)" above.
+
+The GStreamer RTSP implementation underwent significant stability improvements in 2025-10-29 to address resource leaks, deadlocks, and panics:
 
 ### Critical Fixes Applied
 

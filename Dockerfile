@@ -6,9 +6,11 @@
 
 FROM docker.io/rust:slim-bookworm AS build
 ARG TARGETPLATFORM
+ARG USE_GSTREAMER=false
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /usr/local/src/neolink
+
 COPY . /usr/local/src/neolink
 
 # Build the main program or copy from artifact
@@ -23,6 +25,7 @@ COPY . /usr/local/src/neolink
 #
 # hadolint ignore=DL3008
 RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
+  echo "USE_GSTREAMER: ${USE_GSTREAMER}"; \
   if [ -f "${TARGETPLATFORM}/neolink" ]; then \
     echo "Restoring from artifact"; \
     mkdir -p /usr/local/src/neolink/target/release/; \
@@ -36,28 +39,105 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
           openssl \
           libssl-dev \
           ca-certificates \
-          libgstrtspserver-1.0-dev \
-          libgstreamer1.0-dev \
-          libgtk2.0-dev \
-          protobuf-compiler \
-          libglib2.0-dev && \
+          protobuf-compiler && \
+        if [ "${USE_GSTREAMER}" = "true" ]; then \
+          echo "Installing GStreamer build dependencies"; \
+          apt-get install -y --no-install-recommends \
+            libgstrtspserver-1.0-dev \
+            libgstreamer1.0-dev \
+            libgtk2.0-dev \
+            libglib2.0-dev; \
+        fi && \
         apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
-    cargo build --release; \
+    if [ "${USE_GSTREAMER}" = "true" ]; then \
+      echo "Building with GStreamer support"; \
+      cargo build --release --features=gstreamer; \
+    else \
+      echo "Building with FFmpeg support (default)"; \
+      cargo build --release --no-default-features; \
+    fi; \
   fi
 
 # Create the release container. Match the base OS used to build
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime-ffmpeg
+ARG TARGETPLATFORM
+ARG REPO
+ARG VERSION
+ARG OWNER
+ARG MEDIAMTX_VERSION=v1.9.3
+
+LABEL description="An image for the neolink program which is a reolink camera to rtsp translator (FFmpeg + MediaMTX)"
+LABEL repository="$REPO"
+LABEL version="$VERSION"
+LABEL maintainer="$OWNER"
+
+# Install runtime dependencies for FFmpeg mode
+# ffmpeg: Media transcoding and format conversion
+# ca-certificates: SSL/TLS certificates for HTTPS
+# openssl: SSL/TLS library
+# hadolint ignore=DL3008,DL3009
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    # Install base utilities and certificates first
+    apt-get install -y --no-install-recommends \
+        openssl \
+        dnsutils \
+        iputils-ping \
+        ca-certificates \
+        wget \
+        # FFmpeg for transcoding (much smaller than GStreamer)
+        ffmpeg && \
+    apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+# Download and install MediaMTX
+# hadolint ignore=DL3008
+RUN set -ex; \
+    ARCH="$(dpkg --print-architecture)"; \
+    case "${ARCH}" in \
+      amd64) MEDIAMTX_ARCH='amd64' ;; \
+      arm64) MEDIAMTX_ARCH='arm64v8' ;; \
+      armhf) MEDIAMTX_ARCH='armv7' ;; \
+      *) echo "Unsupported architecture: ${ARCH}"; exit 1 ;; \
+    esac; \
+    wget -O /tmp/mediamtx.tar.gz \
+      "https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/mediamtx_${MEDIAMTX_VERSION}_linux_${MEDIAMTX_ARCH}.tar.gz"; \
+    tar -xzf /tmp/mediamtx.tar.gz -C /usr/local/bin/ mediamtx; \
+    chmod +x /usr/local/bin/mediamtx; \
+    rm /tmp/mediamtx.tar.gz; \
+    /usr/local/bin/mediamtx --version
+
+COPY --from=build \
+  /usr/local/src/neolink/target/release/neolink \
+  /usr/local/bin/neolink
+COPY docker/entrypoint-ffmpeg.sh /entrypoint.sh
+
+RUN chmod +x "/usr/local/bin/neolink" && \
+    "/usr/local/bin/neolink" --version && \
+    mkdir -m 0700 /root/.config/
+
+ENV NEO_LINK_MODE="rtsp" \
+    NEO_LINK_PORT=8554 \
+    MEDIAMTX_API_PORT=9997
+
+CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Expose RTSP port (MediaMTX) and API port
+EXPOSE ${NEO_LINK_PORT} ${MEDIAMTX_API_PORT}
+
+# Legacy GStreamer runtime stage (optional)
+FROM debian:bookworm-slim AS runtime-gstreamer
 ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION
 ARG OWNER
 
-LABEL description="An image for the neolink program which is a reolink camera to rtsp translator"
+LABEL description="An image for the neolink program which is a reolink camera to rtsp translator (Legacy GStreamer)"
 LABEL repository="$REPO"
 LABEL version="$VERSION"
 LABEL maintainer="$OWNER"
 
-# Install runtime dependencies
+# Install runtime dependencies for GStreamer mode (legacy)
 # gstreamer1.0-plugins-ugly: Provides x264enc for H.265->H.264 transcoding
 # gstreamer1.0-libav: Provides avdec_h265 decoder for transcoding
 # gstreamer1.0-vaapi: Hardware acceleration via VA-API (Intel/AMD)
@@ -110,3 +190,5 @@ CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
 ENTRYPOINT ["/entrypoint.sh"]
 EXPOSE ${NEO_LINK_PORT}
 
+# Default to FFmpeg runtime
+FROM runtime-ffmpeg

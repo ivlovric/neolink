@@ -49,6 +49,18 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) users: Vec<UserConfig>,
+
+    /// MediaMTX HTTP API URL for stream management
+    #[serde(default = "default_mediamtx_api_url")]
+    pub(crate) mediamtx_api_url: String,
+
+    /// MediaMTX RTSP URL for publishing streams
+    #[serde(default = "default_mediamtx_rtsp_url")]
+    pub(crate) mediamtx_rtsp_url: String,
+
+    /// Path to FFmpeg binary (default: "ffmpeg" from PATH)
+    #[serde(default = "default_ffmpeg_path")]
+    pub(crate) ffmpeg_path: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
@@ -526,6 +538,18 @@ fn default_transcode() -> Option<String> {
 
 fn default_transcode_device() -> Option<String> {
     Some("auto".to_string())
+}
+
+fn default_mediamtx_api_url() -> String {
+    "http://localhost:9997".to_string()
+}
+
+fn default_mediamtx_rtsp_url() -> String {
+    "rtsp://localhost:8554".to_string()
+}
+
+fn default_ffmpeg_path() -> String {
+    "ffmpeg".to_string()
 }
 
 pub(crate) static RESERVED_NAMES: &[&str] = &["anyone", "anonymous"];
