@@ -225,6 +225,12 @@ pub(crate) async fn main(_opt: Opt, reactor: NeoReactor) -> Result<()> {
         }
     }
 
+    // Ensure GStreamer cleanup happens even on normal exit
+    info!("RTSP server shutting down, cleaning up GStreamer resources...");
+    rtsp.quit().await?;
+    rtsp.join().await?;
+    info!("RTSP server shutdown complete");
+
     Ok(())
 }
 

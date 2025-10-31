@@ -334,7 +334,7 @@ pub(super) async fn make_factory(
                             let mut pools = Default::default();
 
                             // Helper to cleanup appsrc elements and release VAAPI resources
-                            let cleanup_sources = |vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>| {
+                            let cleanup_sources = |vid_src: &Option<AppSrc>, aud_src: &Option<AppSrc>, pools: &mut std::collections::HashMap<usize, gstreamer::BufferPool>| {
                                 log::debug!("{name}::{stream}: Cleaning up pipeline sources");
 
                                 if let Some(vid) = vid_src.as_ref() {
@@ -356,6 +356,20 @@ pub(super) async fn make_factory(
                                         log::trace!("{name}::{stream}: Audio appsrc cleaned up");
                                     }
                                 }
+
+                                // Deactivate and cleanup all buffer pools to prevent GLib object leaks
+                                let pool_count = pools.len();
+                                if pool_count > 0 {
+                                    log::debug!("{name}::{stream}: Deactivating {} buffer pools", pool_count);
+                                    for (size, pool) in pools.drain() {
+                                        if let Err(e) = pool.set_active(false) {
+                                            log::warn!("{name}::{stream}: Failed to deactivate buffer pool (size {}): {:?}", size, e);
+                                        } else {
+                                            log::trace!("{name}::{stream}: Deactivated buffer pool (size {})", size);
+                                        }
+                                    }
+                                    log::trace!("{name}::{stream}: All {} buffer pools deactivated", pool_count);
+                                }
                             };
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
@@ -373,7 +387,7 @@ pub(super) async fn make_factory(
                                         "{name}::{stream}: Error sending buffered frame: {e:?}"
                                     );
                                     // Cleanup before returning error
-                                    cleanup_sources(&vid_src, &aud_src);
+                                    cleanup_sources(&vid_src, &aud_src, &mut pools);
                                     return Err(e);
                                 }
                             }
@@ -430,8 +444,10 @@ pub(super) async fn make_factory(
                                 }
                             })();
 
-                            // Always cleanup sources, regardless of success or failure
-                            cleanup_sources(&vid_src, &aud_src);
+                            // Always cleanup sources and buffer pools, regardless of success or failure
+                            log::debug!("{name}::{stream}: Streaming ended, cleaning up all resources");
+                            cleanup_sources(&vid_src, &aud_src, &mut pools);
+                            log::trace!("{name}::{stream}: All resources cleaned up");
 
                             streaming_result
                         });

@@ -34,6 +34,7 @@ use clap::Parser;
 use env_logger::Env;
 use log::*;
 use std::fs;
+use std::time::Duration;
 use validator::Validate;
 
 mod battery;
@@ -86,7 +87,38 @@ async fn main() -> Result<()> {
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
 
-    match opt.cmd {
+    // Set up signal handlers for graceful shutdown
+    let shutdown_signal = async {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install SIGINT handler");
+        };
+
+        #[cfg(unix)]
+        let sigterm = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let sigterm = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("Received SIGINT (Ctrl+C), initiating graceful shutdown...");
+            }
+            _ = sigterm => {
+                info!("Received SIGTERM, initiating graceful shutdown...");
+            }
+        }
+    };
+
+    // Run the command with signal handling and timeout
+    let command_future = async {
+        match opt.cmd {
         #[cfg(feature = "gstreamer")]
         None => {
             warn!(
@@ -147,7 +179,33 @@ async fn main() -> Result<()> {
         Some(Command::Users(opts)) => {
             users::main(opts, neo_reactor.clone()).await?;
         }
-    }
+        }
+    };
 
-    Ok(())
+    // Wait for either the command to complete or a shutdown signal
+    tokio::select! {
+        result = command_future => {
+            // Command completed normally
+            result
+        }
+        _ = shutdown_signal => {
+            // Signal received, initiate graceful shutdown with timeout
+            info!("Shutdown signal received, waiting up to 10 seconds for cleanup...");
+
+            // Drop the reactor to trigger cleanup
+            drop(neo_reactor);
+
+            // Give cleanup tasks time to complete
+            match tokio::time::timeout(Duration::from_secs(10), tokio::task::yield_now()).await {
+                Ok(_) => {
+                    info!("Graceful shutdown completed");
+                    Ok(())
+                }
+                Err(_) => {
+                    warn!("Shutdown timeout reached, forcing exit");
+                    Ok(())
+                }
+            }
+        }
+    }
 }

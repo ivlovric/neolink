@@ -81,11 +81,14 @@ impl NeoRtspServer {
         let main_loop = Arc::new(MainLoop::new(None, false));
 
         // Run the Glib main loop.
+        info!("Starting GStreamer GLib MainLoop thread");
         let main_loop_thread = main_loop.clone();
         let main_loop_cancel = CancellationToken::new();
         let main_loop_gaurd = main_loop_cancel.clone().drop_guard();
         let handle = tokio::task::spawn_blocking(move || {
+            debug!("GLib MainLoop thread started, entering run()...");
             main_loop_thread.run();
+            info!("GLib MainLoop thread exited");
             drop(main_loop_gaurd);
             AnyResult::Ok(())
         });
@@ -131,17 +134,26 @@ impl NeoRtspServer {
     }
 
     pub(crate) async fn quit(&self) -> AnyResult<()> {
+        info!("Requesting GLib MainLoop to quit...");
         if let Some(main_loop) = self.imp().main_loop.read().await.as_ref() {
             main_loop.quit();
+            debug!("GLib MainLoop quit() called");
+        } else {
+            warn!("GLib MainLoop not initialized, cannot quit");
         }
         Ok(())
     }
 
     pub(crate) async fn join(&self) -> AnyResult<()> {
+        info!("Waiting for GStreamer threads to join...");
         let mut threads = self.imp().threads.write().await;
+        let mut count = 0;
         while let Some(thread) = threads.join_next().await {
+            count += 1;
             thread??;
+            debug!("GStreamer thread {} joined", count);
         }
+        info!("All {} GStreamer threads joined successfully", count);
         Ok(())
     }
 
