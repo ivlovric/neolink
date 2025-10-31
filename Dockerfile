@@ -36,6 +36,7 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
         apt-get upgrade -y && \
         apt-get install -y --no-install-recommends \
           build-essential \
+          pkg-config \
           openssl \
           libssl-dev \
           ca-certificates \
