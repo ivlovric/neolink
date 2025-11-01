@@ -382,23 +382,45 @@ async fn camera_main(camera: NeoInstance, mediamtx: &MediaMtxClient, ffmpeg_path
                 backoff = std::cmp::min(backoff * 2, max_backoff);
             }
             Err(e) => {
-                // Stream failed, retry with backoff
-                warn!("{}: Stream failed: {:?}", name, e);
-                warn!("{}: Retrying stream in {}ms", name, backoff.as_millis());
+                let error_msg = format!("{:?}", e);
 
-                tokio::time::sleep(backoff).await;
+                // Detect if this is a connection-related error vs a stream error
+                let is_connection_error = error_msg.contains("channel closed") ||
+                                         error_msg.contains("DroppedConnection") ||
+                                         error_msg.contains("Connection Lost") ||
+                                         error_msg.contains("BcUDP");
 
-                // Reset backoff if we've been running successfully for 60 seconds before this error
-                if let Some(reset_time) = backoff_reset_time {
-                    if reset_time.elapsed() > Duration::from_secs(60) {
-                        backoff = Duration::from_millis(50);
-                        info!("{}: Backoff reset after 60s before error", name);
+                if is_connection_error {
+                    warn!("{}: Stream failed due to camera disconnection: {}", name, error_msg);
+                    warn!("{}: Waiting for camera to reconnect before retrying stream...", name);
+
+                    // Wait longer for camera to reconnect and stabilize
+                    let reconnect_wait = Duration::from_secs(2);
+                    tokio::time::sleep(reconnect_wait).await;
+
+                    // Reset backoff since this is a connection issue, not a stream issue
+                    backoff = Duration::from_millis(100);
+                    backoff_reset_time = None;
+                    info!("{}: Camera reconnection detected, resetting backoff and retrying stream", name);
+                } else {
+                    // Regular stream error, use exponential backoff
+                    warn!("{}: Stream failed: {}", name, error_msg);
+                    warn!("{}: Retrying stream in {}ms", name, backoff.as_millis());
+
+                    tokio::time::sleep(backoff).await;
+
+                    // Reset backoff if we've been running successfully for 60 seconds before this error
+                    if let Some(reset_time) = backoff_reset_time {
+                        if reset_time.elapsed() > Duration::from_secs(60) {
+                            backoff = Duration::from_millis(50);
+                            info!("{}: Backoff reset after 60s before error", name);
+                        }
                     }
-                }
-                backoff_reset_time = Some(tokio::time::Instant::now());
+                    backoff_reset_time = Some(tokio::time::Instant::now());
 
-                // Increase backoff for next failure
-                backoff = std::cmp::min(backoff * 2, max_backoff);
+                    // Increase backoff for next failure
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                }
             }
         }
         // Loop continues to restart streams

@@ -111,6 +111,13 @@ stream = "both"
 # Argus cameras typically send H.265 on mainStream
 transcode_to = "h264"
 
+# Optionally specify which encoder to use for transcoding (default: "auto")
+# transcode_device = "auto"      # Auto-detect (try hardware, fallback to software)
+# transcode_device = "vaapi"     # Force hardware encoding (VAAPI/Intel Quick Sync)
+# transcode_device = "x264"      # Force software encoding (slower, works everywhere)
+# transcode_device = "/dev/dri/renderD128"  # Use specific GPU device
+# Note: Hardware encoding requires GPU access in Docker (see docs)
+
 # Battery camera optimizations (auto-applied if "Argus" detected in model)
 idle_disconnect = true          # Disconnect when no activity to save battery
 codec_detection_timeout = 60    # Battery cameras need longer to wake up

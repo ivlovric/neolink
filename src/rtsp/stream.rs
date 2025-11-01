@@ -4,7 +4,7 @@ use neolink_core::bc_protocol::StreamKind;
 use neolink_core::bcmedia::model::BcMedia;
 
 use crate::common::NeoInstance;
-use super::ffmpeg::{FfmpegConfig, TranscodeMode, VideoCodec, stream_to_ffmpeg};
+use super::ffmpeg::{FfmpegConfig, TranscodeDevice, TranscodeMode, VideoCodec, stream_to_ffmpeg};
 use super::mediamtx::MediaMtxClient;
 
 type AnyResult<T> = anyhow::Result<T, anyhow::Error>;
@@ -70,6 +70,7 @@ pub(crate) async fn stream_main(
         ffmpeg_path: ffmpeg_path.to_string(),
         input_codec: video_codec,
         transcode: transcode_mode,
+        transcode_device: TranscodeDevice::from_config(&camera_config.transcode_device),
         rtsp_url,
         camera_name: name.clone(),
         stream_name: stream.to_string(),

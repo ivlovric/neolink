@@ -27,6 +27,8 @@ pub struct FfmpegConfig {
     pub input_codec: VideoCodec,
     /// Whether to transcode or passthrough
     pub transcode: TranscodeMode,
+    /// Transcode device/encoder selection (hardware vs software)
+    pub transcode_device: TranscodeDevice,
     /// RTSP publish URL (e.g., "rtsp://localhost:8554/CameraName")
     pub rtsp_url: String,
     /// Camera name for logging
@@ -69,6 +71,33 @@ pub enum TranscodeMode {
     TranscodeToH264,
 }
 
+/// Transcode device/encoder selection
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscodeDevice {
+    /// Auto-detect: try hardware (VAAPI), fallback to software (libx264)
+    Auto,
+    /// Force VAAPI hardware encoding (Intel Quick Sync, AMD, etc.)
+    VAAPI(String), // Device path like "/dev/dri/renderD128"
+    /// Force software encoding (libx264)
+    Software,
+}
+
+impl TranscodeDevice {
+    /// Parse from config string
+    pub fn from_config(s: &Option<String>) -> Self {
+        match s.as_deref() {
+            None | Some("auto") => TranscodeDevice::Auto,
+            Some("vaapi") => TranscodeDevice::VAAPI("/dev/dri/renderD128".to_string()),
+            Some("x264") | Some("software") => TranscodeDevice::Software,
+            Some(path) if path.starts_with("/dev/dri/") => TranscodeDevice::VAAPI(path.to_string()),
+            _ => {
+                warn!("Unknown transcode_device value: {:?}, using auto", s);
+                TranscodeDevice::Auto
+            }
+        }
+    }
+}
+
 /// FFmpeg process wrapper
 pub struct FfmpegProcess {
     /// Process handle
@@ -94,7 +123,130 @@ impl FfmpegProcess {
         info!("{}::{}: Spawning FFmpeg process", camera, stream);
         debug!("{}::{}: FFmpeg config: {:?}", camera, stream, config);
 
-        // Build FFmpeg command
+        // Try hardware acceleration first if Auto or VAAPI
+        let use_vaapi = match (&config.transcode, &config.transcode_device) {
+            (TranscodeMode::TranscodeToH264, TranscodeDevice::Auto) => true,
+            (TranscodeMode::TranscodeToH264, TranscodeDevice::VAAPI(_)) => true,
+            _ => false,
+        };
+
+        if use_vaapi {
+            // Try VAAPI first
+            match Self::spawn_with_vaapi(config.clone()) {
+                Ok(process) => return Ok(process),
+                Err(e) => {
+                    match &config.transcode_device {
+                        TranscodeDevice::VAAPI(_) => {
+                            // VAAPI was explicitly requested, don't fallback
+                            return Err(e.context("VAAPI encoding failed (explicitly requested)"));
+                        }
+                        TranscodeDevice::Auto => {
+                            // Auto mode: fallback to software
+                            warn!("{}::{}: VAAPI encoding failed, falling back to software: {}", camera, stream, e);
+                            info!("{}::{}: Using software encoding (libx264)", camera, stream);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Software encoding or passthrough
+        Self::spawn_with_software(config)
+    }
+
+    /// Spawn FFmpeg with VAAPI hardware acceleration
+    fn spawn_with_vaapi(config: FfmpegConfig) -> Result<Self> {
+        let camera = &config.camera_name;
+        let stream = &config.stream_name;
+
+        let vaapi_device = match &config.transcode_device {
+            TranscodeDevice::VAAPI(path) => path.clone(),
+            TranscodeDevice::Auto => "/dev/dri/renderD128".to_string(),
+            _ => "/dev/dri/renderD128".to_string(),
+        };
+
+        info!("{}::{}: Attempting VAAPI hardware encoding (device: {})", camera, stream, vaapi_device);
+
+        // Build FFmpeg command with VAAPI
+        let mut cmd = TokioCommand::new(&config.ffmpeg_path);
+
+        // Hardware acceleration setup (must come before input)
+        cmd.arg("-hwaccel").arg("vaapi")
+            .arg("-hwaccel_device").arg(&vaapi_device)
+            .arg("-hwaccel_output_format").arg("vaapi");
+
+        // Input configuration: read from stdin
+        cmd.arg("-f")
+            .arg(config.input_codec.input_format())
+            .arg("-i")
+            .arg("pipe:0");
+
+        // Video codec configuration with VAAPI
+        match config.transcode {
+            TranscodeMode::Passthrough => {
+                cmd.arg("-c:v").arg("copy");
+            }
+            TranscodeMode::TranscodeToH264 => {
+                cmd.arg("-c:v").arg("h264_vaapi")
+                    .arg("-qp").arg("23"); // Quality (lower = better, 23 is good balance)
+            }
+        }
+
+        // Output configuration: RTSP push
+        cmd.arg("-f")
+            .arg("rtsp")
+            .arg("-rtsp_transport")
+            .arg("tcp")
+            .arg(&config.rtsp_url);
+
+        // FFmpeg options for better reliability
+        cmd.arg("-loglevel")
+            .arg("warning") // Only show warnings and errors
+            .arg("-nostats") // Don't show encoding statistics
+            .arg("-hide_banner"); // Hide FFmpeg banner
+
+        // Stdio configuration
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        // Log the complete FFmpeg command for debugging
+        let cmd_string = format!(
+            "{} -hwaccel vaapi -hwaccel_device {} -hwaccel_output_format vaapi -f {} -i pipe:0 -c:v h264_vaapi -qp 23 -f rtsp -rtsp_transport tcp {} -loglevel warning",
+            config.ffmpeg_path,
+            vaapi_device,
+            config.input_codec.input_format(),
+            config.rtsp_url
+        );
+        info!("{}::{}: FFmpeg command (VAAPI): {}", camera, stream, cmd_string);
+
+        // Spawn the process
+        let mut process = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn FFmpeg with VAAPI: {:?}", cmd))?;
+
+        // Get stdin handle for writing media data
+        let stdin = process
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Failed to open FFmpeg stdin"))?;
+
+        info!("{}::{}: FFmpeg process spawned with VAAPI (PID: {:?})", camera, stream, process.id());
+
+        Ok(Self {
+            process,
+            stdin,
+            config,
+        })
+    }
+
+    /// Spawn FFmpeg with software encoding (libx264)
+    fn spawn_with_software(config: FfmpegConfig) -> Result<Self> {
+        let camera = &config.camera_name;
+        let stream = &config.stream_name;
+
+        // Build FFmpeg command with software encoding
         let mut cmd = TokioCommand::new(&config.ffmpeg_path);
 
         // Input configuration: read from stdin
@@ -147,7 +299,7 @@ impl FfmpegProcess {
             codec_args,
             config.rtsp_url
         );
-        info!("{}::{}: FFmpeg command: {}", camera, stream, cmd_string);
+        info!("{}::{}: FFmpeg command (software): {}", camera, stream, cmd_string);
 
         // Spawn the process
         let mut process = cmd
