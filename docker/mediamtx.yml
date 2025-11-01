@@ -7,30 +7,31 @@
 ###############################################
 
 # Enable HTTP API for Neolink health checks and monitoring
-api: true
+api: yes
 apiAddress: :9997
 
 ###############################################
 # RTSP Server Configuration
 ###############################################
 
+# Enable RTSP server
+rtsp: yes
+
 # RTSP server listening address
 rtspAddress: :8554
 
-# Use TCP for more reliable streaming (especially over Docker networks)
-protocols: [tcp]
-
-# Enable transport protocol (UDP disabled for Docker stability)
-rtspTransport: automatic
+# List of enabled RTSP transport protocols
+# TCP is most reliable for Docker/NAT environments
+rtspTransports: [tcp]
 
 ###############################################
 # Path Configuration
 ###############################################
 
 # Accept RTSP publishing from Neolink/FFmpeg
-# The "all" path matches any stream path (e.g., /CameraName/main, /CameraName/sub)
+# The "all_others" path matches any stream path (e.g., /CameraName/main, /CameraName/sub)
 paths:
-  all:
+  all_others:
     # Source: publisher means MediaMTX will accept incoming RTSP streams
     # from Neolink/FFmpeg and make them available to clients
     source: publisher
@@ -59,34 +60,38 @@ logDestinations: [stdout]
 # Performance Tuning
 ###############################################
 
-# Read timeout for client connections (in seconds)
+# Read timeout for client connections
 readTimeout: 10s
 
-# Write timeout for client connections (in seconds)
+# Write timeout for client connections
 writeTimeout: 10s
 
-# Read buffer size (bytes) - increase for higher throughput
-readBufferCount: 512
+# Size of the queue of outgoing packets
+# Higher value = more throughput, lower value = less RAM
+writeQueueSize: 512
 
 ###############################################
 # Optional: Additional Protocols
 ###############################################
 
-# You can enable other protocols if needed
 # RTMP server (for OBS, etc.)
+rtmp: yes
 rtmpAddress: :1935
 
 # HLS server (for web browsers)
+hls: yes
 hlsAddress: :8888
-hlsAlwaysRemux: false
+hlsAlwaysRemux: no
 hlsVariant: lowLatency
 hlsSegmentCount: 7
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms
 
 # WebRTC server (for web browsers)
+webrtc: yes
 webrtcAddress: :8889
-webrtcICEServers: []
+webrtcICEServers2: []
 
 # SRT server
+srt: yes
 srtAddress: :8890
