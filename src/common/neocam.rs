@@ -68,7 +68,7 @@ impl NeoCam {
 
         let mut me = Self {
             cancel: CancellationToken::new(),
-            config_watch: watch_config_tx,
+            config_watch: watch_config_tx.clone(),
             commander: commander_tx.clone(),
             camera_watch: camera_watch_rx.clone(),
             set,
@@ -194,34 +194,85 @@ impl NeoCam {
             }
         });
 
-        // This thread just does a one time report on camera info
+        // This thread does a one time report on camera info, detects battery cameras,
+        // and applies optimized settings
         let report_instance = instance.subscribe().await?;
         let report_cancel = me.cancel.clone();
         let report_name = config.name.clone();
+        let report_config_watch = watch_config_tx.clone();
         me.set.spawn(async move {
             tokio::select! {
                 _ = report_cancel.cancelled() => {
                     AnyResult::Ok(())
                 }
                 v = async {
+                    // Gather all camera information
                     let version = report_instance.run_task(|cam| Box::pin(
                         async move {
                             Ok(cam.version().await?)
                         }
                     )).await?;
-                    log::info!("{}: Model {}", report_name, version.model.unwrap_or("Undeclared".to_string()));
-                    log::info!("{}: Firmware Version {}", report_name, version.firmwareVersion);
+
+                    let model = version.model.clone().unwrap_or("Undeclared".to_string());
+                    let firmware = version.firmwareVersion.clone();
 
                     let stream_info = report_instance.run_task(|cam| Box::pin(
                         async move {
                             Ok(cam.get_stream_info().await?)
                         }
                     )).await?;
+
                     let mut supported_streams = vec![];
                     for encode in stream_info.stream_infos.iter().flat_map(|stream_info| stream_info.encode_tables.clone()) {
-                        supported_streams.push(std::format!("    {}: {}x{}", encode.name, encode.resolution.width, encode.resolution.height));
+                        supported_streams.push(format!("{}x{} ({})",
+                            encode.resolution.width,
+                            encode.resolution.height,
+                            encode.name));
                     }
 
+                    // Detect battery cameras
+                    let is_battery_camera = model.contains("Argus") ||
+                                           model.contains("Battery") ||
+                                           model.contains("Wireless");
+
+                    // Apply battery-optimized settings if detected
+                    if is_battery_camera {
+                        let mut updated_config = report_config_watch.borrow().clone();
+
+                        // Apply battery-optimized defaults if still using defaults
+                        if updated_config.codec_detection_timeout == 10 {
+                            updated_config.codec_detection_timeout = 30;
+                        }
+                        if updated_config.idle_grace_period == 30 {
+                            updated_config.idle_grace_period = 60;
+                        }
+                        if !updated_config.idle_disconnect {
+                            updated_config.idle_disconnect = true;
+                        }
+
+                        report_config_watch.send_replace(updated_config);
+
+                        log::info!("{}: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", report_name);
+                        log::info!("{}: 🔋 Battery Camera Connected", report_name);
+                        log::info!("{}: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", report_name);
+                        log::info!("{}: Model: {}", report_name, model);
+                        log::info!("{}: Firmware: {}", report_name, firmware);
+                        if !supported_streams.is_empty() {
+                            log::info!("{}: Streams: {}", report_name, supported_streams.join(", "));
+                        }
+                        log::info!("{}: Profile: Battery-optimized (codec timeout: 30s, grace: 60s)", report_name);
+                        log::info!("{}: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", report_name);
+                    } else {
+                        log::info!("{}: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", report_name);
+                        log::info!("{}: Camera Connected", report_name);
+                        log::info!("{}: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", report_name);
+                        log::info!("{}: Model: {}", report_name, model);
+                        log::info!("{}: Firmware: {}", report_name, firmware);
+                        if !supported_streams.is_empty() {
+                            log::info!("{}: Streams: {}", report_name, supported_streams.join(", "));
+                        }
+                        log::info!("{}: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", report_name);
+                    }
 
                     Ok(())
                 } => v
@@ -313,13 +364,28 @@ impl NeoCam {
                     let mut md = md_permit_instance.motion().await.with_context(|| "Unable to acquire motion watcher")?;
                     loop{
                         md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
+
+                        // Check if pre-warming is enabled
+                        let prewarm_enabled = md_permit_instance.config().await?.borrow().prewarm_on_motion;
+
+                        // Pre-warm: immediately start connecting when motion is detected
+                        if prewarm_enabled {
+                            log::debug!("Motion detected - pre-warming camera connection");
+                            if let Err(e) = md_permit_instance.connect().await {
+                                log::warn!("Pre-warm connection failed (non-fatal): {:?}", e);
+                            }
+                        }
+
                         let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
                         md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
-                        // Try waiting for 30s
-                        // If in those 30s we get motion then return to
-                        // loop early to reaquire the permit
+
+                        // Get the current motion permit duration from config
+                        let motion_duration = md_permit_instance.config().await?.borrow().motion_permit_duration;
+
+                        // Try waiting for the configured duration
+                        // If motion is detected during this time, return to loop early to reacquire the permit
                         tokio::select!{
-                            _ = sleep(Duration::from_secs(30)) => {},
+                            _ = sleep(Duration::from_secs(motion_duration)) => {},
                             v = md.wait_for(|md| matches!(md, MdState::Start(_))) => {v.with_context(|| "MD Watcher lost")?;},
                         }
                     }
@@ -343,6 +409,11 @@ impl NeoCam {
                 },
                 v = async {
                     let mut config_rx = connect_instance.config().await?;
+
+                    // Adaptive grace period learning state
+                    let mut connection_times: Vec<tokio::time::Instant> = Vec::new();
+                    let mut adaptive_grace_period: Option<u64> = None;
+
                     loop {
                         // Wait for the green light
                         config_rx.wait_for(|config| config.idle_disconnect).await?;
@@ -360,11 +431,64 @@ impl NeoCam {
                                 permit.deactivate().await?; // Watching only from here
                                 loop {
                                     permit.aquired_users().await?;
+
+                                    // Track connection time for adaptive learning
+                                    let now = tokio::time::Instant::now();
+                                    connection_times.push(now);
+                                    if connection_times.len() > 20 {
+                                        connection_times.remove(0); // Keep only last 20 connections
+                                    }
+
                                     connect_instance.connect().await?;
                                     permit.dropped_users().await?;
-                                    // Wait 30s or if we hit another use then go back and wait again
+
+                                    // Get the current idle grace period from config
+                                    let mut base_grace_period = connect_instance.config().await?.borrow().idle_grace_period;
+
+                                    // Apply adaptive grace period if enabled and we have enough data
+                                    let adaptive_enabled = connect_instance.config().await?.borrow().adaptive_grace_period;
+
+                                    if adaptive_enabled && connection_times.len() >= 3 {
+                                        // Calculate average time between connections
+                                        let mut intervals = Vec::new();
+                                        for i in 1..connection_times.len() {
+                                            let interval = connection_times[i].duration_since(connection_times[i-1]);
+                                            intervals.push(interval.as_secs());
+                                        }
+
+                                        if !intervals.is_empty() {
+                                            let avg_interval = intervals.iter().sum::<u64>() / intervals.len() as u64;
+
+                                            // Adaptive algorithm:
+                                            // - If connections are frequent (< 5 min apart), extend grace period to 2x base
+                                            // - If connections are moderate (5-15 min), use 1.5x base
+                                            // - Otherwise use base grace period
+                                            adaptive_grace_period = Some(if avg_interval < 300 {
+                                                // Frequent connections: extend grace period significantly
+                                                let extended = base_grace_period * 2;
+                                                log::debug!("Adaptive grace: frequent connections detected (avg {}s), extending to {}s",
+                                                           avg_interval, extended);
+                                                extended
+                                            } else if avg_interval < 900 {
+                                                // Moderate frequency: extend moderately
+                                                let extended = base_grace_period + (base_grace_period / 2);
+                                                log::debug!("Adaptive grace: moderate connection frequency (avg {}s), extending to {}s",
+                                                           avg_interval, extended);
+                                                extended
+                                            } else {
+                                                // Infrequent: use base period
+                                                log::debug!("Adaptive grace: infrequent connections (avg {}s), using base {}s",
+                                                           avg_interval, base_grace_period);
+                                                base_grace_period
+                                            });
+
+                                            base_grace_period = adaptive_grace_period.unwrap();
+                                        }
+                                    }
+
+                                    // Wait for the configured (or adapted) grace period or if we hit another use then go back and wait again
                                     tokio::select! {
-                                        _ = sleep(Duration::from_secs(30)) => {},
+                                        _ = sleep(Duration::from_secs(base_grace_period)) => {},
                                         _ = permit.aquired_users() => continue,
                                     };
                                     connect_instance.disconnect().await?;

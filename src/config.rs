@@ -234,6 +234,81 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_transcode_device")]
     pub(crate) transcode_device: Option<String>,
+
+    /// Codec detection timeout in seconds
+    /// Battery cameras may need longer (default: 30s for battery, 10s for others)
+    #[validate(range(
+        min = 5,
+        max = 120,
+        message = "Codec detection timeout must be between 5-120 seconds",
+        code = "codec_detection_timeout"
+    ))]
+    #[serde(default = "default_codec_detection_timeout", alias = "codec_timeout")]
+    pub(crate) codec_detection_timeout: u64,
+
+    /// Idle disconnect grace period in seconds
+    /// How long to wait with no activity before disconnecting battery cameras
+    #[validate(range(
+        min = 5,
+        max = 300,
+        message = "Idle grace period must be between 5-300 seconds",
+        code = "idle_grace_period"
+    ))]
+    #[serde(default = "default_idle_grace_period", alias = "grace_period")]
+    pub(crate) idle_grace_period: u64,
+
+    /// Number of consecutive ping failures before declaring camera disconnected
+    #[validate(range(
+        min = 1,
+        max = 10,
+        message = "Ping retries must be between 1-10",
+        code = "ping_retries"
+    ))]
+    #[serde(default = "default_ping_retries", alias = "retries")]
+    pub(crate) ping_retries: u32,
+
+    /// UDP keepalive interval in seconds
+    /// Client-initiated keepalives to prevent NAT timeout
+    #[validate(range(
+        min = 10,
+        max = 120,
+        message = "Keepalive interval must be between 10-120 seconds",
+        code = "keepalive_interval"
+    ))]
+    #[serde(default = "default_keepalive_interval", alias = "keepalive")]
+    pub(crate) keepalive_interval: u64,
+
+    /// Motion permit duration in seconds
+    /// How long to keep camera alive after motion detection stops
+    #[validate(range(
+        min = 5,
+        max = 300,
+        message = "Motion permit duration must be between 5-300 seconds",
+        code = "motion_permit_duration"
+    ))]
+    #[serde(default = "default_motion_permit_duration", alias = "motion_timeout_ext")]
+    pub(crate) motion_permit_duration: u64,
+
+    /// Pre-motion buffer duration in seconds
+    /// How many seconds of video to keep before motion detection
+    #[validate(range(
+        min = 0,
+        max = 30,
+        message = "Prebuffer duration must be between 0-30 seconds",
+        code = "prebuffer_duration"
+    ))]
+    #[serde(default = "default_prebuffer_duration", alias = "prebuffer")]
+    pub(crate) prebuffer_duration: u64,
+
+    /// Enable adaptive grace period learning
+    /// Automatically adjust grace period based on usage patterns
+    #[serde(default = "default_false", alias = "adaptive")]
+    pub(crate) adaptive_grace_period: bool,
+
+    /// Enable pre-warming on motion detection
+    /// Start connecting immediately when motion is detected
+    #[serde(default = "default_true", alias = "prewarm")]
+    pub(crate) prewarm_on_motion: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -548,6 +623,30 @@ fn default_mediamtx_rtsp_url() -> String {
 
 fn default_ffmpeg_path() -> String {
     "ffmpeg".to_string()
+}
+
+fn default_codec_detection_timeout() -> u64 {
+    10 // 10 seconds, but will be overridden to 30s for battery cameras
+}
+
+fn default_idle_grace_period() -> u64 {
+    30 // 30 seconds
+}
+
+fn default_ping_retries() -> u32 {
+    3 // 3 retries = 15 seconds (reduced from 5)
+}
+
+fn default_keepalive_interval() -> u64 {
+    30 // 30 seconds
+}
+
+fn default_motion_permit_duration() -> u64 {
+    30 // 30 seconds after motion stops
+}
+
+fn default_prebuffer_duration() -> u64 {
+    5 // 5 seconds of pre-motion video
 }
 
 pub(crate) static RESERVED_NAMES: &[&str] = &["anyone", "anonymous"];

@@ -44,7 +44,7 @@ pub(crate) async fn stream_main(
 
     // Learn the stream codec by examining the first few frames
     let (video_codec, transcode_mode, media_rx) =
-        detect_stream_format(media_rx, &camera_config.transcode_to).await?;
+        detect_stream_format(media_rx, &camera_config).await?;
 
     info!(
         "{}: Stream format: {:?}, transcode: {:?}",
@@ -73,21 +73,38 @@ pub(crate) async fn stream_main(
 /// Returns (VideoCodec, TranscodeMode, updated receiver with buffered frames)
 async fn detect_stream_format(
     mut media_rx: tokio::sync::mpsc::Receiver<BcMedia>,
-    transcode_to: &Option<String>,
+    camera_config: &crate::config::CameraConfig,
 ) -> Result<(VideoCodec, TranscodeMode, tokio::sync::mpsc::Receiver<BcMedia>)> {
     // Wrap codec detection in a timeout to handle battery cameras that may not send frames immediately
     // Battery cameras often disconnect before sending frames, so we need a timeout with fallback
     // We also need to wait for an I-frame (keyframe) before starting the stream
-    let detection_timeout = tokio::time::Duration::from_secs(10);
+    let detection_timeout = tokio::time::Duration::from_secs(camera_config.codec_detection_timeout);
+
+    info!("{}: Using codec detection timeout: {}s", camera_config.name, camera_config.codec_detection_timeout);
+
+    // Calculate max frames to buffer based on prebuffer duration
+    // Assume 25 fps average, so prebuffer_duration * 25 frames
+    let max_prebuffer_frames = (camera_config.prebuffer_duration * 25) as usize;
+    let max_frames_to_examine = if max_prebuffer_frames > 50 {
+        max_prebuffer_frames
+    } else {
+        50 // Minimum for codec detection
+    };
+
+    if camera_config.prebuffer_duration > 0 {
+        info!("{}: Pre-buffering enabled: {}s (~{} frames at 25fps)",
+              camera_config.name, camera_config.prebuffer_duration, max_prebuffer_frames);
+    }
 
     let detection_result = tokio::time::timeout(detection_timeout, async {
         let mut buffer = Vec::new();
         let mut detected_codec: Option<VideoCodec> = None;
         let mut has_iframe = false;
+        let continue_buffering = camera_config.prebuffer_duration > 0;
 
         // Examine frames until we have both codec and I-frame
-        // Limit to 50 frames to prevent excessive buffering
-        for frame_count in 0..50 {
+        // If prebuffering is enabled, continue buffering for the configured duration
+        for frame_count in 0..max_frames_to_examine {
             if let Some(media) = media_rx.recv().await {
                 // Check if this is a video frame with codec info
                 match &media {
@@ -105,8 +122,14 @@ async fn detect_stream_format(
                             debug!("Found I-frame after {} frames", frame_count + 1);
                         }
 
-                        // We have both codec and I-frame, we're ready to stream
-                        return Ok::<_, anyhow::Error>((detected_codec, buffer, has_iframe));
+                        // If prebuffering is disabled, we're ready to stream now
+                        // Otherwise, continue buffering until we reach the target duration
+                        if !continue_buffering {
+                            return Ok::<_, anyhow::Error>((detected_codec, buffer, has_iframe));
+                        } else {
+                            debug!("Codec detected, continuing pre-buffer ({}/{} frames)...",
+                                   frame_count + 1, max_frames_to_examine);
+                        }
                     }
                     BcMedia::Pframe(pframe) => {
                         let codec = VideoCodec::from_video_type(pframe.video_type);
@@ -130,8 +153,13 @@ async fn detect_stream_format(
             }
         }
 
-        // Examined 50 frames without finding I-frame (unlikely but possible)
-        warn!("Examined 50 frames without I-frame, codec: {:?}", detected_codec);
+        // Reached max frames limit
+        if continue_buffering {
+            info!("{}: Pre-buffer complete: {} frames buffered", camera_config.name, buffer.len());
+        } else {
+            warn!("{}: Examined {} frames without I-frame, codec: {:?}",
+                  camera_config.name, max_frames_to_examine, detected_codec);
+        }
         Ok((detected_codec, buffer, has_iframe))
     }).await;
 
@@ -140,8 +168,9 @@ async fn detect_stream_format(
         Ok(Ok((codec, buf, iframe))) => (codec, buf, iframe),
         Ok(Err(e)) => return Err(e),
         Err(_timeout) => {
-            warn!("Codec detection timed out after 10 seconds, falling back to H.264");
-            warn!("This is common with battery cameras that wake slowly");
+            warn!("{}: Codec detection timed out after {}s, falling back to H.264",
+                  camera_config.name, camera_config.codec_detection_timeout);
+            warn!("{}: This is common with battery cameras that wake slowly", camera_config.name);
             (None, Vec::new(), false) // Empty buffer on timeout
         }
     };
@@ -153,15 +182,15 @@ async fn detect_stream_format(
     }
 
     let video_codec = detected_codec.unwrap_or_else(|| {
-        warn!("Failed to detect video codec from stream, assuming H.264");
-        warn!("If your camera uses H.265, the stream may not work correctly");
+        warn!("{}: Failed to detect video codec from stream, assuming H.264", camera_config.name);
+        warn!("{}: If your camera uses H.265, the stream may not work correctly", camera_config.name);
         VideoCodec::H264 // Default fallback to H.264 (most common)
     });
 
     // Determine transcode mode based on codec and config
-    let transcode_mode = match (video_codec, transcode_to) {
+    let transcode_mode = match (video_codec, &camera_config.transcode_to) {
         (VideoCodec::H265, Some(target)) if target.to_lowercase() == "h264" => {
-            info!("Will transcode H.265 -> H.264");
+            info!("{}: Will transcode H.265 -> H.264", camera_config.name);
             TranscodeMode::TranscodeToH264
         }
         (VideoCodec::H265, None) => {
