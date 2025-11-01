@@ -24,9 +24,9 @@ trap cleanup TERM INT
 
 ulimit -n 65535
 
-# Start MediaMTX in the background
-echo "Starting MediaMTX RTSP server..."
-/usr/local/bin/mediamtx &
+# Start MediaMTX in the background with configuration
+echo "Starting MediaMTX RTSP server with config..."
+/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml &
 MEDIAMTX_PID=$!
 echo "MediaMTX started (PID: $MEDIAMTX_PID)"
 

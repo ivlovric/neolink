@@ -1,0 +1,92 @@
+# MediaMTX Configuration for Neolink
+# This configuration enables the HTTP API required by Neolink for health checks
+# and configures path publishing to accept RTSP streams from FFmpeg.
+
+###############################################
+# API Configuration (REQUIRED for Neolink)
+###############################################
+
+# Enable HTTP API for Neolink health checks and monitoring
+api: true
+apiAddress: :9997
+
+###############################################
+# RTSP Server Configuration
+###############################################
+
+# RTSP server listening address
+rtspAddress: :8554
+
+# Use TCP for more reliable streaming (especially over Docker networks)
+protocols: [tcp]
+
+# Enable transport protocol (UDP disabled for Docker stability)
+rtspTransport: automatic
+
+###############################################
+# Path Configuration
+###############################################
+
+# Accept RTSP publishing from Neolink/FFmpeg
+# The "all" path matches any stream path (e.g., /CameraName/main, /CameraName/sub)
+paths:
+  all:
+    # Source: publisher means MediaMTX will accept incoming RTSP streams
+    # from Neolink/FFmpeg and make them available to clients
+    source: publisher
+
+    # Allow any client to read streams (no authentication)
+    # If you want authentication, uncomment and set these:
+    # readUser: viewer
+    # readPass: password
+
+    # Allow local publishers (Neolink/FFmpeg) without authentication
+    # If you want to restrict publishing, uncomment and set these:
+    # publishUser: neolink
+    # publishPass: secret
+
+###############################################
+# Logging
+###############################################
+
+# Log level: debug, info, warn, error
+logLevel: info
+
+# Log destinations: stdout, file
+logDestinations: [stdout]
+
+###############################################
+# Performance Tuning
+###############################################
+
+# Read timeout for client connections (in seconds)
+readTimeout: 10s
+
+# Write timeout for client connections (in seconds)
+writeTimeout: 10s
+
+# Read buffer size (bytes) - increase for higher throughput
+readBufferCount: 512
+
+###############################################
+# Optional: Additional Protocols
+###############################################
+
+# You can enable other protocols if needed
+# RTMP server (for OBS, etc.)
+rtmpAddress: :1935
+
+# HLS server (for web browsers)
+hlsAddress: :8888
+hlsAlwaysRemux: false
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+
+# WebRTC server (for web browsers)
+webrtcAddress: :8889
+webrtcICEServers: []
+
+# SRT server
+srtAddress: :8890

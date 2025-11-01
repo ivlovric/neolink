@@ -95,6 +95,7 @@ COPY --from=build \
   /usr/local/src/neolink/target/release/neolink \
   /usr/local/bin/neolink
 COPY docker/entrypoint-ffmpeg.sh /entrypoint.sh
+COPY docker/mediamtx.yml /etc/mediamtx/mediamtx.yml
 
 RUN chmod +x "/usr/local/bin/neolink" && \
     chmod +x /entrypoint.sh && \
