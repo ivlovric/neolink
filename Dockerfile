@@ -49,7 +49,7 @@ ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION
 ARG OWNER
-ARG MEDIAMTX_VERSION=v1.9.3
+ARG MEDIAMTX_VERSION=v1.15.3
 
 LABEL description="An image for the neolink program which is a reolink camera to rtsp translator"
 LABEL repository="$REPO"
