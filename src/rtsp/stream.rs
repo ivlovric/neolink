@@ -77,24 +77,47 @@ async fn detect_stream_format(
 ) -> Result<(VideoCodec, TranscodeMode, tokio::sync::mpsc::Receiver<BcMedia>)> {
     // Wrap codec detection in a timeout to handle battery cameras that may not send frames immediately
     // Battery cameras often disconnect before sending frames, so we need a timeout with fallback
+    // We also need to wait for an I-frame (keyframe) before starting the stream
     let detection_timeout = tokio::time::Duration::from_secs(10);
 
     let detection_result = tokio::time::timeout(detection_timeout, async {
         let mut buffer = Vec::new();
-        // Examine up to 20 frames to detect codec
-        for _ in 0..20 {
+        let mut detected_codec: Option<VideoCodec> = None;
+        let mut has_iframe = false;
+
+        // Examine frames until we have both codec and I-frame
+        // Limit to 50 frames to prevent excessive buffering
+        for frame_count in 0..50 {
             if let Some(media) = media_rx.recv().await {
                 // Check if this is a video frame with codec info
                 match &media {
                     BcMedia::Iframe(iframe) => {
                         let codec = VideoCodec::from_video_type(iframe.video_type);
                         buffer.push(media);
-                        return Ok::<_, anyhow::Error>((Some(codec), buffer));
+                        has_iframe = true;
+
+                        if detected_codec.is_none() {
+                            // First video frame is an I-frame - perfect!
+                            debug!("Detected {:?} codec from I-frame", codec);
+                            detected_codec = Some(codec);
+                        } else {
+                            // We already knew the codec from a P-frame, now we have the I-frame
+                            debug!("Found I-frame after {} frames", frame_count + 1);
+                        }
+
+                        // We have both codec and I-frame, we're ready to stream
+                        return Ok::<_, anyhow::Error>((detected_codec, buffer, has_iframe));
                     }
                     BcMedia::Pframe(pframe) => {
                         let codec = VideoCodec::from_video_type(pframe.video_type);
                         buffer.push(media);
-                        return Ok((Some(codec), buffer));
+
+                        if detected_codec.is_none() {
+                            // Detected codec from P-frame, but we need an I-frame to start
+                            info!("Detected {:?} codec from P-frame, waiting for I-frame...", codec);
+                            detected_codec = Some(codec);
+                        }
+                        // Continue looping - we need an I-frame before streaming
                     }
                     _ => {
                         // Audio or info frame, keep buffering
@@ -102,24 +125,32 @@ async fn detect_stream_format(
                     }
                 }
             } else {
-                // Stream ended before detecting codec
-                return Ok((None, buffer));
+                // Stream ended before we got what we needed
+                return Ok((detected_codec, buffer, has_iframe));
             }
         }
-        // Examined 20 frames without finding video
-        Ok((None, buffer))
+
+        // Examined 50 frames without finding I-frame (unlikely but possible)
+        warn!("Examined 50 frames without I-frame, codec: {:?}", detected_codec);
+        Ok((detected_codec, buffer, has_iframe))
     }).await;
 
     // Handle timeout or detection result
-    let (detected_codec, buffer) = match detection_result {
-        Ok(Ok((codec, buf))) => (codec, buf),
+    let (detected_codec, buffer, has_iframe) = match detection_result {
+        Ok(Ok((codec, buf, iframe))) => (codec, buf, iframe),
         Ok(Err(e)) => return Err(e),
         Err(_timeout) => {
             warn!("Codec detection timed out after 10 seconds, falling back to H.264");
             warn!("This is common with battery cameras that wake slowly");
-            (None, Vec::new()) // Empty buffer on timeout
+            (None, Vec::new(), false) // Empty buffer on timeout
         }
     };
+
+    // Warn if we're starting without an I-frame (stream may not decode properly)
+    if !has_iframe && !buffer.is_empty() {
+        warn!("Starting stream without I-frame - video may not display initially");
+        warn!("Clients will need to wait for the next I-frame to start decoding");
+    }
 
     let video_codec = detected_codec.unwrap_or_else(|| {
         warn!("Failed to detect video codec from stream, assuming H.264");
