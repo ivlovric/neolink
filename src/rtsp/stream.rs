@@ -75,36 +75,57 @@ async fn detect_stream_format(
     mut media_rx: tokio::sync::mpsc::Receiver<BcMedia>,
     transcode_to: &Option<String>,
 ) -> Result<(VideoCodec, TranscodeMode, tokio::sync::mpsc::Receiver<BcMedia>)> {
-    let mut buffer = Vec::new();
-    let mut video_codec = None;
+    // Wrap codec detection in a timeout to handle battery cameras that may not send frames immediately
+    // Battery cameras often disconnect before sending frames, so we need a timeout with fallback
+    let detection_timeout = tokio::time::Duration::from_secs(10);
 
-    // Examine up to 20 frames to detect codec
-    for _ in 0..20 {
-        if let Some(media) = media_rx.recv().await {
-            // Check if this is a video frame with codec info
-            match &media {
-                BcMedia::Iframe(iframe) => {
-                    video_codec = Some(VideoCodec::from_video_type(iframe.video_type));
-                    buffer.push(media);
-                    break; // Found codec, stop buffering
+    let detection_result = tokio::time::timeout(detection_timeout, async {
+        let mut buffer = Vec::new();
+        // Examine up to 20 frames to detect codec
+        for _ in 0..20 {
+            if let Some(media) = media_rx.recv().await {
+                // Check if this is a video frame with codec info
+                match &media {
+                    BcMedia::Iframe(iframe) => {
+                        let codec = VideoCodec::from_video_type(iframe.video_type);
+                        buffer.push(media);
+                        return Ok::<_, anyhow::Error>((Some(codec), buffer));
+                    }
+                    BcMedia::Pframe(pframe) => {
+                        let codec = VideoCodec::from_video_type(pframe.video_type);
+                        buffer.push(media);
+                        return Ok((Some(codec), buffer));
+                    }
+                    _ => {
+                        // Audio or info frame, keep buffering
+                        buffer.push(media);
+                    }
                 }
-                BcMedia::Pframe(pframe) => {
-                    video_codec = Some(VideoCodec::from_video_type(pframe.video_type));
-                    buffer.push(media);
-                    break; // Found codec, stop buffering
-                }
-                _ => {
-                    // Audio or info frame, keep buffering
-                    buffer.push(media);
-                }
+            } else {
+                // Stream ended before detecting codec
+                return Ok((None, buffer));
             }
-        } else {
-            return Err(anyhow!("Stream ended before detecting codec"));
         }
-    }
+        // Examined 20 frames without finding video
+        Ok((None, buffer))
+    }).await;
 
-    let video_codec = video_codec
-        .ok_or_else(|| anyhow!("Failed to detect video codec from stream"))?;
+    // Handle timeout or detection result
+    let (detected_codec, buffer) = match detection_result {
+        Ok(Ok((codec, buf))) => (codec, buf),
+        Ok(Err(e)) => return Err(e),
+        Err(_timeout) => {
+            warn!("Codec detection timed out after 10 seconds, falling back to H.264");
+            warn!("This is common with battery cameras that wake slowly");
+            (None, Vec::new()) // Empty buffer on timeout
+        }
+    };
+
+    let video_codec = detected_codec.unwrap_or_else(|| {
+        warn!("Failed to detect video codec from stream, assuming H.264");
+        warn!("If your camera uses H.265, the stream may not work correctly");
+        VideoCodec::H264 // Default fallback to H.264 (most common)
+    });
 
     // Determine transcode mode based on codec and config
     let transcode_mode = match (video_codec, transcode_to) {
