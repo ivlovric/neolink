@@ -55,12 +55,12 @@ impl MediaMtxClient {
     /// Health check: verify MediaMTX is running and accessible
     ///
     /// This uses the MediaMTX HTTP API to check if the server is responsive.
-    /// The API endpoint `/v3/config/get` returns the current configuration.
+    /// The API endpoint `/v3/config/global/get` returns the current global configuration.
     ///
     /// # Returns
     /// Ok(()) if MediaMTX is accessible, Err otherwise
     pub async fn health_check(&self) -> Result<()> {
-        let url = format!("{}/v3/config/get", self.api_url);
+        let url = format!("{}/v3/config/global/get", self.api_url);
 
         debug!("MediaMTX health check: GET {}", url);
 

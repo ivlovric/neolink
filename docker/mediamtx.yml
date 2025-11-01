@@ -79,19 +79,19 @@ rtmp: yes
 rtmpAddress: :1935
 
 # HLS server (for web browsers)
-hls: yes
-hlsAddress: :8888
-hlsAlwaysRemux: no
-hlsVariant: lowLatency
-hlsSegmentCount: 7
-hlsSegmentDuration: 1s
-hlsPartDuration: 200ms
+#hls: yes
+#hlsAddress: :8888
+#hlsAlwaysRemux: no
+#hlsVariant: lowLatency
+#hlsSegmentCount: 7
+#hlsSegmentDuration: 1s
+#hlsPartDuration: 200ms
 
 # WebRTC server (for web browsers)
-webrtc: yes
-webrtcAddress: :8889
-webrtcICEServers2: []
+#webrtc: yes
+#webrtcAddress: :8889
+#webrtcICEServers2: []
 
-# SRT server
-srt: yes
-srtAddress: :8890
+## SRT server
+#srt: yes
+#srtAddress: :8890
