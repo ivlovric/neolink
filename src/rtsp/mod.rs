@@ -259,6 +259,12 @@ async fn camera_main(camera: NeoInstance, mediamtx: &MediaMtxClient, ffmpeg_path
     });
 
     let mut camera_config = camera.config().await?.clone();
+
+    // Retry logic for stream restarts (similar to camthread.rs reconnection logic)
+    let mut backoff = Duration::from_millis(50);
+    let max_backoff = Duration::from_secs(5);
+    let mut backoff_reset_time: Option<tokio::time::Instant> = None;
+
     loop {
         let prev_stream_config = camera_config.borrow_and_update().stream;
         let active_streams = prev_stream_config
@@ -267,12 +273,14 @@ async fn camera_main(camera: NeoInstance, mediamtx: &MediaMtxClient, ffmpeg_path
             .collect::<HashSet<_>>();
 
         // This select is for changes to camera_config.stream
-        break tokio::select! {
+        let stream_result = tokio::select! {
             v = camera_config.wait_for(|config| config.stream != prev_stream_config) => {
                 if let Err(e) = v {
                     AnyResult::Err(e.into())
                 } else {
-                    // config.stream changed restart
+                    // config.stream changed, restart immediately
+                    info!("{}: Stream configuration changed, restarting streams", name);
+                    backoff = Duration::from_millis(50); // Reset backoff on config change
                     continue;
                 }
             },
@@ -351,7 +359,48 @@ async fn camera_main(camera: NeoInstance, mediamtx: &MediaMtxClient, ffmpeg_path
                 }
             } => v,
         };
-    }?;
 
-    Ok(())
+        // Handle stream exit and retry logic
+        match stream_result {
+            Ok(_) => {
+                // Stream completed successfully (rare, usually config change or shutdown)
+                info!("{}: Stream completed normally, restarting in {}ms", name, backoff.as_millis());
+                tokio::time::sleep(backoff).await;
+
+                // Reset backoff if we've been running successfully for 60 seconds
+                if let Some(reset_time) = backoff_reset_time {
+                    if reset_time.elapsed() > Duration::from_secs(60) {
+                        backoff = Duration::from_millis(50);
+                        backoff_reset_time = None;
+                        info!("{}: Backoff reset after 60s of stable streaming", name);
+                    }
+                } else {
+                    backoff_reset_time = Some(tokio::time::Instant::now());
+                }
+
+                // Increase backoff for next potential failure
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+            Err(e) => {
+                // Stream failed, retry with backoff
+                warn!("{}: Stream failed: {:?}", name, e);
+                warn!("{}: Retrying stream in {}ms", name, backoff.as_millis());
+
+                tokio::time::sleep(backoff).await;
+
+                // Reset backoff if we've been running successfully for 60 seconds before this error
+                if let Some(reset_time) = backoff_reset_time {
+                    if reset_time.elapsed() > Duration::from_secs(60) {
+                        backoff = Duration::from_millis(50);
+                        info!("{}: Backoff reset after 60s before error", name);
+                    }
+                }
+                backoff_reset_time = Some(tokio::time::Instant::now());
+
+                // Increase backoff for next failure
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+            }
+        }
+        // Loop continues to restart streams
+    }
 }
