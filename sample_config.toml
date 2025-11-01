@@ -97,6 +97,47 @@ address = "192.168.1.187:9000"
 # print_format = "None"
 
 
+# Example: Argus Battery Camera with H.265 Transcoding and Optimizations
+[[cameras]]
+name = "backyard_battery"
+username = "admin"
+password = "password123"
+uid = "9527000KJLYHAX9V"  # Battery cameras use UID instead of address
+
+# Enable BOTH streams (mainStream and subStream)
+stream = "both"
+
+# Transcode mainStream H.265 → H.264 for better compatibility
+# Argus cameras typically send H.265 on mainStream
+transcode_to = "h264"
+
+# Battery camera optimizations (auto-applied if "Argus" detected in model)
+idle_disconnect = true          # Disconnect when no activity to save battery
+codec_detection_timeout = 60    # Battery cameras need longer to wake up
+idle_grace_period = 60          # Wait 60s before disconnecting (default: 30s)
+ping_retries = 3                # Faster failure detection
+motion_permit_duration = 30     # Keep alive 30s after motion stops
+
+# Advanced: Adaptive grace period learns from usage patterns
+# adaptive_grace_period = true
+
+# Advanced: Pre-warming connects camera immediately on motion detection
+# prewarm_on_motion = true
+
+# Advanced: Pre-buffer video before motion events (0-30 seconds)
+# prebuffer_duration = 5
+
+# Motion-based streaming to save battery
+[cameras.pause]
+on_motion = true
+mode = "none"
+
+# Optional: MQTT for battery level monitoring
+# [cameras.mqtt]
+# enable_battery = true
+# battery_update = 2000  # Update every 2 seconds
+
+
 [[cameras]]
 name = "storage shed"
 username = "admin"

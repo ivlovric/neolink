@@ -136,6 +136,19 @@ impl FfmpegProcess {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
+        // Log the complete FFmpeg command for debugging
+        let codec_args = match config.transcode {
+            TranscodeMode::Passthrough => "-c:v copy",
+            TranscodeMode::TranscodeToH264 => "-c:v libx264 -preset medium -tune zerolatency",
+        };
+        let cmd_string = format!("{} -f {} -i pipe:0 {} -f rtsp -rtsp_transport tcp {} -loglevel warning",
+            config.ffmpeg_path,
+            config.input_codec.input_format(),
+            codec_args,
+            config.rtsp_url
+        );
+        info!("{}::{}: FFmpeg command: {}", camera, stream, cmd_string);
+
         // Spawn the process
         let mut process = cmd
             .spawn()

@@ -46,10 +46,24 @@ pub(crate) async fn stream_main(
     let (video_codec, transcode_mode, media_rx) =
         detect_stream_format(media_rx, &camera_config).await?;
 
-    info!(
-        "{}: Stream format: {:?}, transcode: {:?}",
-        name, video_codec, transcode_mode
-    );
+    // Log detected codec and transcoding configuration
+    match (video_codec, transcode_mode) {
+        (VideoCodec::H264, TranscodeMode::Passthrough) => {
+            info!("{}: ✓ Stream codec: H.264 (passthrough, no transcoding)", name);
+        }
+        (VideoCodec::H265, TranscodeMode::Passthrough) => {
+            info!("{}: ✓ Stream codec: H.265 (passthrough, no transcoding)", name);
+            warn!("{}: ⚠️  H.265 passthrough - some clients may not support this!", name);
+            warn!("{}: Consider adding 'transcode_to = \"h264\"' to config for compatibility", name);
+        }
+        (VideoCodec::H265, TranscodeMode::TranscodeToH264) => {
+            info!("{}: ✓ Stream codec: H.265 → H.264 (transcoding enabled)", name);
+            info!("{}: FFmpeg will transcode to H.264 for better compatibility", name);
+        }
+        _ => {
+            info!("{}: Stream format: {:?}, transcode: {:?}", name, video_codec, transcode_mode);
+        }
+    }
 
     // Build FFmpeg configuration
     let ffmpeg_config = FfmpegConfig {
