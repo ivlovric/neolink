@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
 use log::*;
 use neolink_core::bc_protocol::StreamKind;
-use neolink_core::bcmedia::model::{BcMedia, VideoType};
-use std::collections::HashSet;
+use neolink_core::bcmedia::model::BcMedia;
 
 use crate::common::NeoInstance;
 use super::ffmpeg::{FfmpegConfig, TranscodeMode, VideoCodec, stream_to_ffmpeg};

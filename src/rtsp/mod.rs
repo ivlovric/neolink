@@ -52,8 +52,7 @@
 //   - `"test"`: Switches to the gstreamer test image. Requires more cpu as the stream is fully reencoded
 //   - `"none"`: Resends the last iframe the camera. This does not reencode at all.  **Most use cases should use this one as it has the least effort on the cpu and gives what you would expect**
 //
-use anyhow::{anyhow, Context, Result};
-use gstreamer_rtsp_server::prelude::*;
+use anyhow::{Context, Result};
 use log::*;
 use neolink_core::bc_protocol::StreamKind;
 use std::collections::{HashMap, HashSet};
@@ -78,10 +77,13 @@ mod factory;
 #[cfg(feature = "gstreamer")]
 mod gst;
 
+// GStreamer imports only needed for legacy code
+#[cfg(feature = "gstreamer")]
+use gstreamer_rtsp_server::prelude::*;
+
 use crate::common::{NeoInstance, NeoReactor};
 use stream::*;
 
-use super::config::UserConfig;
 pub(crate) use cmdline::Opt;
 
 // Use MediaMTX client instead of GStreamer RTSP server

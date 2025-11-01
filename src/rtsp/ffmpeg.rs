@@ -13,7 +13,7 @@
 use anyhow::{anyhow, Context, Result};
 use log::*;
 use neolink_core::bcmedia::model::{BcMedia, VideoType};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
